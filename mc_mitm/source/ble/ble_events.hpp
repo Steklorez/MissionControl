@@ -75,6 +75,7 @@ namespace ams::ble::events {
 
     // Last GATT client btm registered, usable as ours since btm never connects with it on a retail console
     u8 GetSpareClientIf();
+    void ClearSpareClientIf();
 
     /* Queue consumed by the host thread */
     u32 TakeRingDropped();

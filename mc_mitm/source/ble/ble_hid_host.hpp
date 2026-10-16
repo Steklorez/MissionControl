@@ -36,4 +36,9 @@ namespace ams::ble {
     void Launch();
     void WaitFinished();
 
+    // Called from the power module thread when the console starts going to sleep, while the bluetooth module
+    // is still awake: drops the controller's link so nothing is left on the air to wake the console, then marks
+    // the radio unavailable to the host.
+    void PrepareForSleep();
+
 }

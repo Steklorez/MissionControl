@@ -221,6 +221,54 @@ namespace ams::ble {
             }
         }
 
+        // EXPERIMENT. The stack refuses every CreateBond for a controller that has been switched off until the
+        // console restarts. A restart is not the only thing that resets the stack: btm cycles the radio whenever
+        // btdrv reports a BluetoothCrash, which is how BLE came up in PrepareClient. Ask btdrv for one and pick up
+        // the GATT client btm registers afterwards, as the bring-up does.
+        void RecycleRadio() {
+            if (!mitm::GetGlobalConfig()->ble.radio_cycle || !events::IsRadioEnabled()) {
+                return;
+            }
+
+            events::ClearSpareClientIf();
+
+            Result rc = btdrvEmulateBluetoothCrash(BtdrvFatalReason_Unknown1);
+            log::Write("radio cycle: btdrvEmulateBluetoothCrash rc=0x%x", rc.GetValue());
+            if (R_FAILED(rc)) {
+                return;
+            }
+
+            events::Pump(TimeSpan::FromSeconds(6));
+            g_pairing_failed_tick = 0;
+
+            if (u8 spare = events::GetSpareClientIf(); spare != InvalidClientIf) {
+                g_client_if = spare;
+                log::Write("radio cycle: btm brought BLE back up, using gatt client_if=%u", g_client_if);
+                return;
+            }
+
+            // btm did not bring BLE back up on its own; do what the bring-up does
+            rc = btdrvEnableBle();
+            log::Write("radio cycle: btdrvEnableBle rc=0x%x", rc.GetValue());
+            events::Pump(TimeSpan::FromSeconds(6));
+
+            if (u8 spare = events::GetSpareClientIf(); spare != InvalidClientIf) {
+                g_client_if = spare;
+                log::Write("radio cycle: using gatt client_if=%u", g_client_if);
+                return;
+            }
+
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (R_SUCCEEDED(RegisterGattClient())) {
+                    log::Write("radio cycle: registered gatt client_if=%u", g_client_if);
+                    return;
+                }
+                os::SleepThread(TimeSpan::FromSeconds(2));
+            }
+
+            log::Write("radio cycle: no gatt client available, keeping client_if=%u", g_client_if);
+        }
+
         /* Finding and connecting the controller */
 
         Result Scan(bluetooth::Address *out_address, TimeSpan duration) {
@@ -495,6 +543,8 @@ namespace ams::ble {
                     g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                     log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
                     Disconnect();
+                    // A cycle clears the backoff: the next attempt is against a fresh stack
+                    RecycleRadio();
                     os::SleepThread(TimeSpan::FromSeconds(1));
                     continue;
                 }
@@ -520,8 +570,10 @@ namespace ams::ble {
                 RunConnected(conn_id);
 
                 // Nothing beyond the teardown is asked of the stack once the link is gone: removing the bond and
-                // detaching the HID host layer here were both tried and changed nothing
+                // detaching the HID host layer here were both tried and changed nothing. A radio cycle is the one
+                // thing left to try (skipped when the link ended because the console is going to sleep).
                 Disconnect();
+                RecycleRadio();
             }
         }
 
@@ -560,6 +612,35 @@ namespace ams::ble {
         if (g_launched) {
             os::WaitThread(&g_thread);
         }
+    }
+
+    // EXPERIMENT. A controller left connected wakes the console a few seconds after it goes to sleep. The link
+    // is dropped here, from the power module thread, while the bluetooth module is still awake (it is listed as
+    // a dependency of ours), so that nothing is left on the air by the time the radio goes down. The host thread
+    // sees the radio marked unavailable and stays off it until FullAwake.
+    void PrepareForSleep() {
+        const bool was_enabled = events::IsRadioEnabled();
+        events::SetRadioEnabled(false);
+
+        // MinimumAwake and SleepReady both come through here; only the first one has anything to do
+        if (!g_launched || !was_enabled) {
+            return;
+        }
+
+        const u32 conn_id = events::GetConnection();
+        if ((conn_id == InvalidConnId) || events::IsDisconnected()) {
+            log::Write("going to sleep, no link to drop");
+            return;
+        }
+
+        Result rc = btdrvDisconnectGattServer(conn_id);
+        log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_id, rc.GetValue());
+
+        // The disconnection is reported on btdrv's event thread, independently of the host thread
+        for (int i = 0; (i < 30) && !events::IsDisconnected(); ++i) {
+            os::SleepThread(TimeSpan::FromMilliSeconds(50));
+        }
+        log::Write(events::IsDisconnected() ? "link down before sleep" : "link still up as sleep begins");
     }
 
 }

@@ -17,6 +17,7 @@
 #include <stratosphere.hpp>
 #include "mcmitm_initialization.hpp"
 #include "ble/ble_events.hpp"
+#include "ble/ble_hid_host.hpp"
 #include "mcmitm_config.hpp"
 #include "mcmitm_process_monitor.hpp"
 
@@ -93,7 +94,9 @@ namespace ams {
 
         // Initialise pm module
         psc::PmModuleId pm_module_id = static_cast<psc::PmModuleId>(0xBD);
-        const psc::PmModuleId pm_dependencies[] = { psc::PmModuleId_Fs };
+        // Bluetooth is listed so that this module is put to sleep before, and woken after, the bluetooth module:
+        // the BLE host then still has a working stack to drop its link on the way down
+        const psc::PmModuleId pm_dependencies[] = { psc::PmModuleId_Fs, psc::PmModuleId_Bluetooth };
         psc::PmModule pm_module;
         psc::PmState pm_state;
         psc::PmFlagSet pm_flags;
@@ -119,6 +122,7 @@ namespace ams {
 
         // Loop events until shutdown signal is received
         bool shutdown = false;
+        psc::PmState last_pm_state = psc::PmState_FullAwake;
         while (!shutdown) {
             auto signalled_holder = os::WaitAny(&wait_manager);
             switch (os::GetMultiWaitHolderUserData(signalled_holder)) {
@@ -126,12 +130,19 @@ namespace ams {
                     pm_module.GetEventPointer()->Clear();
                     if (R_SUCCEEDED(pm_module.GetRequest(&pm_state, &pm_flags))) {
                         switch (pm_state) {
+                            case psc::PmState_MinimumAwake:
+                                // First step on the way to sleep (it is also passed on the way back up, after
+                                // EssentialServicesAwake): the earliest moment to drop the BLE link
+                                if (last_pm_state == psc::PmState_FullAwake) {
+                                    ams::ble::PrepareForSleep();
+                                }
+                                break;
                             case psc::PmState_ShutdownReady:
                                 shutdown = true;
                                 [[fallthrough]];
                             case psc::PmState_SleepReady:
                                 // Any BLE radio activity from here on would wake the console straight back up
-                                ams::ble::events::SetRadioEnabled(false);
+                                ams::ble::PrepareForSleep();
                                 break;
                             case psc::PmState_FullAwake:
                                 ams::ble::events::SetRadioEnabled(true);
@@ -139,6 +150,7 @@ namespace ams {
                             default:
                                 break;
                         }
+                        last_pm_state = pm_state;
                     }
 
                     R_ABORT_UNLESS(pm_module.Acknowledge(pm_state, ResultSuccess()));
