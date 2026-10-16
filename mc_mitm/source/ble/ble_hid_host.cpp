@@ -221,11 +221,20 @@ namespace ams::ble {
             }
         }
 
+        // Set when PrepareForSleep dropped the link: that end of link is no reason to cycle the radio on wake
+        constinit bool g_dropped_for_sleep = false;
+
         // EXPERIMENT. The stack refuses every CreateBond for a controller that has been switched off until the
         // console restarts. A restart is not the only thing that resets the stack: btm cycles the radio whenever
         // btdrv reports a BluetoothCrash, which is how BLE came up in PrepareClient. Ask btdrv for one and pick up
         // the GATT client btm registers afterwards, as the bring-up does.
         void RecycleRadio() {
+            if (g_dropped_for_sleep) {
+                g_dropped_for_sleep = false;
+                log::Write("link was dropped for sleep, no radio cycle");
+                return;
+            }
+
             if (!mitm::GetGlobalConfig()->ble.radio_cycle || !events::IsRadioEnabled()) {
                 return;
             }
@@ -282,11 +291,33 @@ namespace ams::ble {
             events::ExpectFilterEvent();
             static_cast<void>(btdrvEnableBleScanFilter(false));
 
-            Result rc = btdrvStartBleScan();
+            // The two filter calls answer asynchronously; let them land before asking for the scan
+            for (int i = 0; i < 2; ++i) {
+                events::WaitFor(BtdrvBleEventType_ScanFilter, TimeSpan::FromMilliSeconds(400), nullptr, [](const EventRecord &) { return true; });
+            }
+
+            // The stack refuses the scan (0x2a871) for as long as btm's classic inquiry has the radio: 10.24 s at
+            // a time from the moment the Controllers screen opens, repeated with hardly a gap while it stays
+            // open. Keep asking for as long as the screen is open rather than giving up for 3 s on each refusal.
+            Result rc;
+            int attempts = 0;
+            for (;;) {
+                rc = btdrvStartBleScan();
+                if (R_SUCCEEDED(rc) || (++attempts >= 150) || !events::IsPairingWindowOpen()) {
+                    break;
+                }
+                if (attempts == 1) {
+                    log::Write("btdrvStartBleScan rc=0x%x, retrying", rc.GetValue());
+                }
+                events::Pump(TimeSpan::FromMilliSeconds(200));
+            }
             if (R_FAILED(rc)) {
-                log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
+                log::Write("btdrvStartBleScan rc=0x%x after %d attempts", rc.GetValue(), attempts);
                 events::Pump(TimeSpan::FromSeconds(1));
                 return rc;
+            }
+            if (attempts > 0) {
+                log::Write("scanning (%d refused attempts first)", attempts);
             }
 
             EventRecord e;
@@ -633,6 +664,7 @@ namespace ams::ble {
             return;
         }
 
+        g_dropped_for_sleep = true;
         Result rc = btdrvDisconnectGattServer(conn_id);
         log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_id, rc.GetValue());
 
