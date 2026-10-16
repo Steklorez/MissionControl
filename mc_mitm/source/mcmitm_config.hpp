@@ -42,6 +42,7 @@ namespace ams::mitm {
         struct {
             bool enable;
             bool log;
+            bool radio_cycle;
         } ble;
     };
 

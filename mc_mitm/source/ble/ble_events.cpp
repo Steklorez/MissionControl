@@ -403,6 +403,11 @@ namespace ams::ble::events {
         return g_spare_client_if;
     }
 
+    void ClearSpareClientIf() {
+        std::scoped_lock lk(g_lock);
+        g_spare_client_if = InvalidClientIf;
+    }
+
     u32 TakeRingDropped() {
         std::scoped_lock lk(g_lock);
         const u32 dropped = g_ring_dropped;
