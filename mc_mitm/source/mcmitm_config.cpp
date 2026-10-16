@@ -42,7 +42,8 @@ namespace ams::mitm {
             .ble = {
                 .enable = false,
                 .log = false,
-                .radio_cycle = false
+                .radio_cycle = false,
+                .auto_connect = false
             }
         };
 
@@ -123,6 +124,8 @@ namespace ams::mitm {
                     ParseBoolean(value, &config->ble.log);
                 } else if (strcasecmp(name, "radio_cycle") == 0) {
                     ParseBoolean(value, &config->ble.radio_cycle);
+                } else if (strcasecmp(name, "auto_connect") == 0) {
+                    ParseBoolean(value, &config->ble.auto_connect);
                 }
             } else {
                 return 0;

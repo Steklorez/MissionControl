@@ -254,6 +254,12 @@ namespace ams::ble::events {
         g_bond_complete = false;
     }
 
+    void RememberAttempted(const bluetooth::Address *address) {
+        std::scoped_lock lk(g_lock);
+        g_attempted = *address;
+        g_have_attempted = true;
+    }
+
     bool GetTarget(bluetooth::Address *out) {
         std::scoped_lock lk(g_lock);
         if (g_have_target) {
@@ -470,9 +476,26 @@ namespace ams::ble::events {
                     log::Write("evt ScanResult status=0x%02x", info.scan_result.status);
                 }
                 break;
-            case BtdrvBleEventType_ScanFilter:
+            case BtdrvBleEventType_ScanFilter: {
+                // btm retries its scan filter installation every ~120 ms for as long as an LE link is up, and every
+                // attempt fails the same way (result 49): a run of identical results is logged once, with its length
+                // when it ends. Only the host thread logs, so plain statics suffice.
+                static u32 s_last_result = 0;
+                static u32 s_last_action = 0;
+                static u32 s_run = 0;
+                if ((s_run > 0) && (info.scan_filter.result == s_last_result) && (info.scan_filter.action == s_last_action)) {
+                    ++s_run;
+                    break;
+                }
+                if (s_run > 1) {
+                    log::Write("  (repeated %u more times)", s_run - 1);
+                }
                 log::Write("evt ScanFilter result=%u action=%u", info.scan_filter.result, info.scan_filter.action);
+                s_last_result = info.scan_filter.result;
+                s_last_action = info.scan_filter.action;
+                s_run = 1;
                 break;
+            }
             case BtdrvBleEventType_ClientNotify: {
                 auto &notify = info.client_notify;
                 char chr[0x40];

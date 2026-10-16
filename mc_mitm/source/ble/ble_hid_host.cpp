@@ -221,6 +221,106 @@ namespace ams::ble {
             }
         }
 
+        /* Auto-connect: the remembered controller, reconnected by the stack when it comes back */
+
+        constexpr const char LastDevicePath[] = "sdmc:/config/MissionControl/ble_last_device.bin";
+
+        constinit os::SdkMutex g_autoconnect_lock;
+        constinit bool g_have_remembered = false;
+        constinit bluetooth::Address g_remembered = {};
+        constinit bool g_autoconnect_armed = false;
+
+        bool AutoConnectEnabled() {
+            return mitm::GetGlobalConfig()->ble.auto_connect;
+        }
+
+        void LoadRememberedDevice() {
+            if (!AutoConnectEnabled()) {
+                return;
+            }
+
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), LastDevicePath, fs::OpenMode_Read))) {
+                log::Write("auto-connect: no remembered controller");
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+
+            bluetooth::Address address;
+            size_t read = 0;
+            if (R_FAILED(fs::ReadFile(std::addressof(read), file, 0, std::addressof(address), sizeof(address))) || (read != sizeof(address))) {
+                return;
+            }
+
+            {
+                std::scoped_lock lk(g_autoconnect_lock);
+                g_remembered = address;
+                g_have_remembered = true;
+            }
+            events::RememberAttempted(&address);
+            events::LogAddress("auto-connect: remembered controller", address);
+        }
+
+        void SaveRememberedDevice(const bluetooth::Address &address) {
+            {
+                std::scoped_lock lk(g_autoconnect_lock);
+                if (g_have_remembered && AddressEqual(g_remembered, address)) {
+                    return;
+                }
+                g_remembered = address;
+                g_have_remembered = true;
+            }
+
+            if (!AutoConnectEnabled()) {
+                return;
+            }
+
+            static_cast<void>(fs::CreateFile(LastDevicePath, sizeof(address)));
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), LastDevicePath, fs::OpenMode_Write))) {
+                log::Write("auto-connect: could not save the controller");
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+            static_cast<void>(fs::SetFileSize(file, sizeof(address)));
+            static_cast<void>(fs::WriteFile(file, 0, std::addressof(address), sizeof(address), fs::WriteOption::Flush));
+            events::LogAddress("auto-connect: saved controller", address);
+        }
+
+        // EXPERIMENT. A controller switched on by its Xbox button looks for the console it last connected to with
+        // directed advertisements, which scans do not report. A background connection request puts its address on
+        // the stack's accept list and the stack connects the moment the controller advertises; the link then
+        // arrives on the Adopt path and is paired afresh like any other.
+        void ArmAutoConnect() {
+            std::scoped_lock lk(g_autoconnect_lock);
+            if (!AutoConnectEnabled() || !g_have_remembered || g_autoconnect_armed || !events::IsRadioEnabled() || (g_client_if == InvalidClientIf)) {
+                return;
+            }
+
+            Result rc = btdrvConnectGattServer(g_client_if, g_remembered, false, 0);
+            log::Write("auto-connect: btdrvConnectGattServer(background) rc=0x%x", rc.GetValue());
+            g_autoconnect_armed = R_SUCCEEDED(rc);
+        }
+
+        // The pending request must not stay behind a scan or a direct connection (the stack ends up with
+        // connections it never completes) nor through a sleep (the controller would wake the console)
+        void DisarmAutoConnect(const char *why) {
+            std::scoped_lock lk(g_autoconnect_lock);
+            if (!g_autoconnect_armed) {
+                return;
+            }
+            g_autoconnect_armed = false;
+
+            Result rc = btdrvCancelConnectGattServer(g_client_if, g_remembered, false);
+            log::Write("auto-connect: cancelled (%s) rc=0x%x", why, rc.GetValue());
+        }
+
+        // The request is gone without a cancel: completed (the link came up) or wiped by a radio cycle
+        void ForgetAutoConnect() {
+            std::scoped_lock lk(g_autoconnect_lock);
+            g_autoconnect_armed = false;
+        }
+
         // EXPERIMENT. The stack refuses every CreateBond for a controller that has been switched off until the
         // console restarts. A restart is not the only thing that resets the stack: btm cycles the radio whenever
         // btdrv reports a BluetoothCrash, which is how BLE came up in PrepareClient. Ask btdrv for one and pick up
@@ -231,6 +331,7 @@ namespace ams::ble {
             }
 
             events::ClearSpareClientIf();
+            ForgetAutoConnect();
 
             Result rc = btdrvEmulateBluetoothCrash(BtdrvFatalReason_Unknown1);
             log::Write("radio cycle: btdrvEmulateBluetoothCrash rc=0x%x", rc.GetValue());
@@ -282,12 +383,32 @@ namespace ams::ble {
             events::ExpectFilterEvent();
             static_cast<void>(btdrvEnableBleScanFilter(false));
 
-            Result rc = btdrvStartBleScan();
+            // The two filter calls answer asynchronously; let them land before asking for the scan
+            for (int i = 0; i < 2; ++i) {
+                events::WaitFor(BtdrvBleEventType_ScanFilter, TimeSpan::FromMilliSeconds(400), nullptr, [](const EventRecord &) { return true; });
+            }
+
+            // The stack refuses the scan (0x2a871) while btm's classic inquiry has the radio, which it does for
+            // 10 s at a time once the Controllers screen opens; retrying every 400 ms catches the gap between
+            // inquiries within half a second instead of the 3 s each refusal used to cost
+            Result rc;
+            int attempts = 0;
+            for (;;) {
+                rc = btdrvStartBleScan();
+                if (R_SUCCEEDED(rc) || (++attempts >= 25) || !events::IsPairingWindowOpen()) {
+                    break;
+                }
+                if (attempts == 1) {
+                    log::Write("btdrvStartBleScan rc=0x%x, retrying", rc.GetValue());
+                }
+                events::Pump(TimeSpan::FromMilliSeconds(400));
+            }
             if (R_FAILED(rc)) {
-                log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
+                log::Write("btdrvStartBleScan rc=0x%x after %d attempts", rc.GetValue(), attempts);
                 events::Pump(TimeSpan::FromSeconds(1));
                 return rc;
             }
+            log::Write("scanning (%d refused attempts first)", attempts);
 
             EventRecord e;
             // Ends early if a link came up by itself or the console is going to sleep
@@ -423,6 +544,7 @@ namespace ams::ble {
             }
             controller::AttachVirtualController(controller);
             g_pairing_failed_tick = 0;
+            SaveRememberedDevice(address);
 
             // hid registers a controller on the first input report, and the pad only reports when something is
             // touched, so its resting state is delivered once here (sticks centred, nothing pressed)
@@ -509,6 +631,7 @@ namespace ams::ble {
 
             StartLeHidListener();
             events::SetSink(gatt::OnEvent);
+            LoadRememberedDevice();
 
             for (;;) {
                 WaitForRadio();
@@ -517,7 +640,13 @@ namespace ams::ble {
                 u32 conn_id = InvalidConnId;
 
                 bool connected = Adopt(&address, &conn_id);
+                if (connected) {
+                    // The link that came up is the pending request completing
+                    ForgetAutoConnect();
+                }
+
                 if (!connected && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive()) {
+                    DisarmAutoConnect("scanning");
                     Result rc = Scan(&address, TimeSpan::FromSeconds(10));
                     if (Adopt(&address, &conn_id)) {
                         connected = true;
@@ -530,6 +659,10 @@ namespace ams::ble {
                 }
 
                 if (!connected) {
+                    // Nothing to do until the controller comes back; leave the stack waiting for it
+                    if (!events::IsPairingWindowOpen()) {
+                        ArmAutoConnect();
+                    }
                     os::SleepThread(TimeSpan::FromSeconds(2));
                     continue;
                 }
@@ -626,6 +759,8 @@ namespace ams::ble {
         if (!g_launched || !was_enabled) {
             return;
         }
+
+        DisarmAutoConnect("sleep");
 
         const u32 conn_id = events::GetConnection();
         if ((conn_id == InvalidConnId) || events::IsDisconnected()) {
