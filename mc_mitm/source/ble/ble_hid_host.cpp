@@ -228,7 +228,6 @@ namespace ams::ble {
         constinit os::SdkMutex g_autoconnect_lock;
         constinit bool g_have_remembered = false;
         constinit bluetooth::Address g_remembered = {};
-        constinit bool g_autoconnect_armed = false;
 
         bool AutoConnectEnabled() {
             return mitm::GetGlobalConfig()->ble.auto_connect;
@@ -287,51 +286,47 @@ namespace ams::ble {
             events::LogAddress("auto-connect: saved controller", address);
         }
 
-        // EXPERIMENT. A controller switched on by its Xbox button looks for the console it last connected to with
-        // directed advertisements, which scans do not report. A background connection request puts its address on
-        // the stack's accept list and the stack connects the moment the controller advertises; the link then
-        // arrives on the Adopt path and is paired afresh like any other.
-        void ArmAutoConnect() {
+        bool GetRememberedDevice(bluetooth::Address *out) {
             std::scoped_lock lk(g_autoconnect_lock);
-            if (!AutoConnectEnabled() || !g_have_remembered || g_autoconnect_armed || !events::IsRadioEnabled() || (g_client_if == InvalidClientIf)) {
-                return;
+            if (g_have_remembered) {
+                *out = g_remembered;
             }
-
-            Result rc = btdrvConnectGattServer(g_client_if, g_remembered, false, 0);
-            log::Write("auto-connect: btdrvConnectGattServer(background) rc=0x%x", rc.GetValue());
-            g_autoconnect_armed = R_SUCCEEDED(rc);
+            return g_have_remembered;
         }
 
-        // The pending request must not stay behind a scan or a direct connection (the stack ends up with
-        // connections it never completes) nor through a sleep (the controller would wake the console)
-        void DisarmAutoConnect(const char *why) {
-            std::scoped_lock lk(g_autoconnect_lock);
-            if (!g_autoconnect_armed) {
-                return;
-            }
-            g_autoconnect_armed = false;
+        // A background connection request (ConnectGattServer with is_direct=false) was tried first: the stack
+        // accepted it but never connected when the controller was switched on by its Xbox button, and the
+        // request could not be cancelled afterwards (0x29e71). Without a Secure Connections bond the controller
+        // has no console to reconnect to and just switches itself off again, so the Xbox button alone cannot
+        // bring it back. What works outside the Controllers screen is the sync button: the controller then
+        // advertises to anyone, and a scan finds it at once since btm's inquiry only runs while the screen is
+        // open. Scanning in bursts while no controller is connected keeps the radio mostly free.
+        constexpr TimeSpan BackgroundScanDuration = TimeSpan::FromMilliSeconds(2500);
+        constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(3500);
 
-            Result rc = btdrvCancelConnectGattServer(g_client_if, g_remembered, false);
-            log::Write("auto-connect: cancelled (%s) rc=0x%x", why, rc.GetValue());
+        bool BackgroundScanWanted() {
+            return AutoConnectEnabled() && g_have_remembered && events::IsRadioEnabled() && !events::IsPairingWindowOpen();
         }
 
-        // The request is gone without a cancel: completed (the link came up) or wiped by a radio cycle
-        void ForgetAutoConnect() {
-            std::scoped_lock lk(g_autoconnect_lock);
-            g_autoconnect_armed = false;
-        }
+        // Set when PrepareForSleep dropped the link: that end of link is no reason to cycle the radio on wake
+        constinit bool g_dropped_for_sleep = false;
 
         // EXPERIMENT. The stack refuses every CreateBond for a controller that has been switched off until the
         // console restarts. A restart is not the only thing that resets the stack: btm cycles the radio whenever
         // btdrv reports a BluetoothCrash, which is how BLE came up in PrepareClient. Ask btdrv for one and pick up
         // the GATT client btm registers afterwards, as the bring-up does.
         void RecycleRadio() {
+            if (g_dropped_for_sleep) {
+                g_dropped_for_sleep = false;
+                log::Write("link was dropped for sleep, no radio cycle");
+                return;
+            }
+
             if (!mitm::GetGlobalConfig()->ble.radio_cycle || !events::IsRadioEnabled()) {
                 return;
             }
 
             events::ClearSpareClientIf();
-            ForgetAutoConnect();
 
             Result rc = btdrvEmulateBluetoothCrash(BtdrvFatalReason_Unknown1);
             log::Write("radio cycle: btdrvEmulateBluetoothCrash rc=0x%x", rc.GetValue());
@@ -372,7 +367,8 @@ namespace ams::ble {
 
         /* Finding and connecting the controller */
 
-        Result Scan(bluetooth::Address *out_address, TimeSpan duration) {
+        // With `only` set, nothing but that controller is accepted (background scans outside the pairing window)
+        Result Scan(bluetooth::Address *out_address, TimeSpan duration, const bluetooth::Address *only = nullptr) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -388,36 +384,42 @@ namespace ams::ble {
                 events::WaitFor(BtdrvBleEventType_ScanFilter, TimeSpan::FromMilliSeconds(400), nullptr, [](const EventRecord &) { return true; });
             }
 
-            // The stack refuses the scan (0x2a871) while btm's classic inquiry has the radio, which it does for
-            // 10 s at a time once the Controllers screen opens; retrying every 400 ms catches the gap between
-            // inquiries within half a second instead of the 3 s each refusal used to cost
+            // The stack refuses the scan (0x2a871) for as long as btm's classic inquiry has the radio: 10.24 s at
+            // a time from the moment the Controllers screen opens, repeated with hardly a gap while it stays
+            // open. Keep asking while the screen is open; outside it the scan starts at once.
             Result rc;
             int attempts = 0;
+            const bool in_window = events::IsPairingWindowOpen();
             for (;;) {
                 rc = btdrvStartBleScan();
-                if (R_SUCCEEDED(rc) || (++attempts >= 25) || !events::IsPairingWindowOpen()) {
+                if (R_SUCCEEDED(rc) || (++attempts >= (in_window ? 150 : 3)) || (in_window && !events::IsPairingWindowOpen())) {
                     break;
                 }
                 if (attempts == 1) {
                     log::Write("btdrvStartBleScan rc=0x%x, retrying", rc.GetValue());
                 }
-                events::Pump(TimeSpan::FromMilliSeconds(400));
+                events::Pump(TimeSpan::FromMilliSeconds(200));
             }
             if (R_FAILED(rc)) {
                 log::Write("btdrvStartBleScan rc=0x%x after %d attempts", rc.GetValue(), attempts);
                 events::Pump(TimeSpan::FromSeconds(1));
                 return rc;
             }
-            log::Write("scanning (%d refused attempts first)", attempts);
+            if (attempts > 0) {
+                log::Write("scanning (%d refused attempts first)", attempts);
+            }
 
             EventRecord e;
             // Ends early if a link came up by itself or the console is going to sleep
-            const bool found = events::WaitFor(events::InvalidType, duration, &e, [](const EventRecord &r) {
+            const bool found = events::WaitFor(events::InvalidType, duration, &e, [only](const EventRecord &r) {
                 if (r.type != BtdrvBleEventType_ScanResult) {
                     return events::HasAdoptedConnection() || !events::IsRadioEnabled();
                 }
                 if (r.info.scan_result.status != BleScanStatus_NewDevice) {
                     return false;
+                }
+                if (only) {
+                    return AddressEqual(r.info.scan_result.address, *only);
                 }
                 AdvertisementSummary summary;
                 ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
@@ -640,17 +642,20 @@ namespace ams::ble {
                 u32 conn_id = InvalidConnId;
 
                 bool connected = Adopt(&address, &conn_id);
-                if (connected) {
-                    // The link that came up is the pending request completing
-                    ForgetAutoConnect();
-                }
 
-                if (!connected && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive()) {
-                    DisarmAutoConnect("scanning");
-                    Result rc = Scan(&address, TimeSpan::FromSeconds(10));
+                // Any gamepad in pairing mode while the Controllers screen is open; only the remembered one,
+                // in short bursts, the rest of the time
+                bluetooth::Address remembered;
+                const bool in_window = events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive();
+                const bool background = !in_window && !PairingBackoffActive() && BackgroundScanWanted() && GetRememberedDevice(&remembered);
+                if (!connected && (in_window || background)) {
+                    Result rc = in_window ? Scan(&address, TimeSpan::FromSeconds(10)) : Scan(&address, BackgroundScanDuration, &remembered);
                     if (Adopt(&address, &conn_id)) {
                         connected = true;
                     } else if (R_SUCCEEDED(rc)) {
+                        if (background) {
+                            log::Write("remembered controller is in pairing mode, connecting");
+                        }
                         connected = R_SUCCEEDED(Connect(address, &conn_id, TimeSpan::FromSeconds(15)));
                         if (!connected) {
                             Disconnect();
@@ -659,11 +664,7 @@ namespace ams::ble {
                 }
 
                 if (!connected) {
-                    // Nothing to do until the controller comes back; leave the stack waiting for it
-                    if (!events::IsPairingWindowOpen()) {
-                        ArmAutoConnect();
-                    }
-                    os::SleepThread(TimeSpan::FromSeconds(2));
+                    os::SleepThread(background ? BackgroundScanPause : TimeSpan::FromSeconds(2));
                     continue;
                 }
 
@@ -760,14 +761,13 @@ namespace ams::ble {
             return;
         }
 
-        DisarmAutoConnect("sleep");
-
         const u32 conn_id = events::GetConnection();
         if ((conn_id == InvalidConnId) || events::IsDisconnected()) {
             log::Write("going to sleep, no link to drop");
             return;
         }
 
+        g_dropped_for_sleep = true;
         Result rc = btdrvDisconnectGattServer(conn_id);
         log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_id, rc.GetValue());
 
