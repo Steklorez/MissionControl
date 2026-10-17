@@ -391,7 +391,7 @@ namespace ams::ble {
         // advertises to anyone, and a scan finds it at once since btm's inquiry only runs while the screen is
         // open. Scanning in bursts while no controller is connected keeps the radio mostly free.
         constexpr TimeSpan BackgroundScanDuration = TimeSpan::FromMilliSeconds(2500);
-        constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(3500);
+        constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(2000);
 
         bool BackgroundScanWanted() {
             return AutoConnectEnabled() && g_have_remembered && events::IsRadioEnabled() && !events::IsPairingWindowOpen();
@@ -609,7 +609,8 @@ namespace ams::ble {
                     break;
                 }
                 if (events::TakeBondComplete()) {
-                    events::Pump(TimeSpan::FromSeconds(1));
+                    // A refusal drops the link within a few hundred milliseconds of this event
+                    events::Pump(TimeSpan::FromMilliSeconds(500));
                     if (!events::IsDisconnected()) {
                         log::Write("paired");
                         return true;

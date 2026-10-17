@@ -102,8 +102,10 @@ namespace ams::ble::gatt {
         }
         g_table.address = address;
 
-        // The stack runs discovery on its own shortly after connecting to a device it hasn't seen
-        events::Pump(TimeSpan::FromSeconds(2));
+        // The stack runs discovery on its own shortly after connecting (its first cache report arrives within a
+        // second); wait for that rather than a fixed two seconds, then let the remaining reports trail in
+        events::WaitFor(BtdrvBleEventType_ClientCacheSave, TimeSpan::FromSeconds(2), nullptr, [&](const EventRecord &r) { return r.info.client_cache_save.conn_id == conn_id; });
+        events::Pump(TimeSpan::FromMilliSeconds(400));
 
         Result rc = btdrvGetGattAttribute(address, conn_id);
         log::Write("btdrvGetGattAttribute rc=0x%x", rc.GetValue());
