@@ -41,4 +41,9 @@ namespace ams::ble {
     // the radio unavailable to the host.
     void PrepareForSleep();
 
+    // Called from the btdrv mitm when btm starts or stops searching for controllers, which it does while the
+    // Controllers screen is open. A connected controller is then withdrawn from hid, as the screen does with
+    // every other controller, and comes back when LB+RB are pressed (any button once the screen is closed).
+    void OnPairingWindow(bool open);
+
 }

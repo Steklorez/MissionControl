@@ -176,12 +176,14 @@ namespace ams::mitm::bluetooth {
     Result BtdrvMitmService::StartInquiry(u32 services, s64 duration) {
         ams::ble::events::SetInquiryActive(true);
         ams::ble::log::Write("btm started an inquiry, duration=%ld", duration);
+        ams::ble::OnPairingWindow(true);
         R_RETURN(btdrvStartInquiryFwd(m_forward_service.get(), services, duration));
     }
 
     Result BtdrvMitmService::StopInquiry() {
         ams::ble::events::SetInquiryActive(false);
         ams::ble::log::Write("btm stopped its inquiry");
+        ams::ble::OnPairingWindow(false);
         R_RETURN(btdrvStopInquiryFwd(m_forward_service.get()));
     }
 

@@ -100,6 +100,8 @@ namespace ams::controller {
        tracked separately so the btm mitm can report them to hid as connected devices. */
     void AttachVirtualController(std::shared_ptr<SwitchController> controller);
     void DetachVirtualController(bluetooth::Address address);
+    // Attach again a controller detached earlier in the same connection (its storage is already initialised)
+    void ReattachVirtualController(std::shared_ptr<SwitchController> controller);
     size_t GetVirtualDevices(bluetooth::Address *out, size_t max);
 
 }

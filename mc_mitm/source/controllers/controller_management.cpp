@@ -375,6 +375,16 @@ namespace ams::controller {
         mitm::btm::condition::Signal();
     }
 
+    void ReattachVirtualController(std::shared_ptr<SwitchController> controller) {
+        {
+            std::scoped_lock lk(g_controller_lock);
+            g_controllers.push_back(controller);
+            g_virtual_devices.push_back(controller->Address());
+        }
+
+        mitm::btm::condition::Signal();
+    }
+
     void DetachVirtualController(bluetooth::Address address) {
         RemoveHandler(address);
 
