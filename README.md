@@ -109,7 +109,9 @@ To pair, open *Controllers → Change Grip/Order* and hold the controller's sync
 
 Pairing a controller again after it has been switched off needs `radio_cycle=true` in the `[ble]` section: the stack refuses to pair a controller it has seen before until it has been reset, so Mission Control has the console cycle its Bluetooth radio whenever a controller's link ends (the same cycle as the one at boot: classic controllers connected at that moment reconnect a couple of seconds later). Without it, pairing again needs a console restart.
 
-A connected controller is disconnected when the console goes to sleep and switches itself off shortly after, so it does not wake the console.
+With `auto_connect=true`, Mission Control remembers the last controller and keeps looking for it in short bursts whenever no controller is connected, so that holding its sync button anywhere (HOME menu, in a game) connects it within about ten seconds, without opening the Controllers screen. The first pairing of a controller still happens from *Change Grip/Order*.
+
+A connected controller is disconnected when the console goes to sleep and switches itself off shortly after, so it does not wake the console. On the *Change Grip/Order* screen it behaves like any other controller: it is withdrawn when the screen opens and comes back on LB+RB (or on any button once the screen is closed).
 
 The `[ble]` section also offers a `log` option that writes what the BLE host is doing to `/config/MissionControl/ble.log`, which is useful when reporting problems.
 
