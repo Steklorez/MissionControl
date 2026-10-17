@@ -254,6 +254,12 @@ namespace ams::ble::events {
         g_bond_complete = false;
     }
 
+    void RememberAttempted(const bluetooth::Address *address) {
+        std::scoped_lock lk(g_lock);
+        g_attempted = *address;
+        g_have_attempted = true;
+    }
+
     bool GetTarget(bluetooth::Address *out) {
         std::scoped_lock lk(g_lock);
         if (g_have_target) {

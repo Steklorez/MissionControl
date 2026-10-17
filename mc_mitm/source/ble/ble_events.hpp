@@ -39,6 +39,9 @@ namespace ams::ble::events {
 
     void SetTarget(const bluetooth::Address *address);
     bool GetTarget(bluetooth::Address *out);
+    // An address a link may come up for without a target being set (a controller remembered from an earlier
+    // boot); SetTarget records its address the same way
+    void RememberAttempted(const bluetooth::Address *address);
     void SetConnection(u32 conn_id);
     u32 GetConnection();
     bool IsDisconnected();
