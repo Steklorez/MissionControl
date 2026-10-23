@@ -294,11 +294,15 @@ namespace ams::ble {
 
         // Blocks while the system has BLE switched off (sleep): any radio activity then wakes the console. A wake
         // re-registers btm's clients, so ours is picked up again afterwards.
+        void RecycleRadio();
+
         void WaitForRadio() {
+            bool woke = false;
             if (!events::IsRadioEnabled()) {
                 log::Write("ble switched off by the system, waiting");
                 events::WaitRadioEnabled();
                 log::Write("ble switched back on");
+                woke = true;
             }
 
             if (events::TakeRadioCycled()) {
@@ -307,6 +311,13 @@ namespace ams::ble {
                     g_client_if = spare;
                 }
                 log::Write("using gatt client_if=%u", g_client_if);
+            }
+
+            // The stack refuses the first pairing after a wake, and the controller only stays in pairing mode for
+            // a few seconds after that refusal; cycling straight away lets the first attempt after a wake succeed
+            if (woke) {
+                log::Write("radio cycle after wake");
+                RecycleRadio();
             }
         }
 
@@ -776,9 +787,10 @@ namespace ams::ble {
                     g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                     log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
                     Disconnect();
-                    // A cycle clears the backoff: the next attempt is against a fresh stack
+                    // A cycle clears the backoff: the next attempt is against a fresh stack. A connection asked for
+                    // within a couple of seconds of the cycle fails to be established (0x3e), so let it settle.
                     RecycleRadio();
-                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    os::SleepThread(TimeSpan::FromSeconds(3));
                     continue;
                 }
 
