@@ -15,6 +15,7 @@
  */
 #pragma once
 #include "xbox_one_controller.hpp"
+#include "ble_hid_controller.hpp"
 
 namespace ams::controller {
 
@@ -25,7 +26,7 @@ namespace ams::controller {
      * id, so input is re-framed and handed to the regular XboxOneController mapping. Output (rumble) goes back as
      * a GATT write to the HID output Report characteristic instead of over an L2CAP HID channel.
      */
-    class XboxOneBleController : public XboxOneController {
+    class XboxOneBleController : public XboxOneController, public BleHidController {
 
         public:
             XboxOneBleController(bluetooth::Address address, u32 conn_id, const BtdrvGattId &service_id, bool service_primary, const BtdrvGattId &output_report_id)
@@ -35,8 +36,10 @@ namespace ams::controller {
             , m_service_primary(service_primary)
             , m_output_report_id(output_report_id) { }
 
-            // Payload of a notification from the HID input Report characteristic
-            Result HandleInputReport(const u8 *data, size_t size);
+            Result HandleInputReport(const u8 *data, size_t size) override;
+            Result HandleNeutralReport() override;
+            bool ReportHasShoulderButtons(const u8 *data, size_t size) const override;
+            bool ReportHasAnyInput(const u8 *data, size_t size) const override;
 
         protected:
             void ProcessInputData(const bluetooth::HidReport *report) override;

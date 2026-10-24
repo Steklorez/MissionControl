@@ -23,6 +23,7 @@
 #include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "../controllers/controller_management.hpp"
 #include "../controllers/xbox_one_ble_controller.hpp"
+#include "../controllers/8bitdo_ble_controller.hpp"
 
 namespace ams::ble {
 
@@ -54,7 +55,20 @@ namespace ams::ble {
 
         /* The controller currently presented to the system */
         constinit os::SdkMutex g_controller_lock;
-        std::shared_ptr<controller::XboxOneBleController> g_controller;
+        std::shared_ptr<controller::BleHidController> g_controller;
+        std::shared_ptr<controller::SwitchController> g_switch_controller;
+
+        // Which driver the connected pad gets, told apart by the HID Report Map read while subscribing
+        enum ControllerKind {
+            ControllerKind_Xbox,
+            ControllerKind_EightBitDo,
+        };
+        constinit ControllerKind g_controller_kind = ControllerKind_Xbox;
+
+        void NoteReportMap(const u8 *map, size_t size) {
+            g_controller_kind = controller::EightBitDoBleController::MatchesReportMap(map, size) ? ControllerKind_EightBitDo : ControllerKind_Xbox;
+            log::Write("report map size=%u, %s controller", static_cast<u32>(size), (g_controller_kind == ControllerKind_EightBitDo) ? "8BitDo" : "Xbox");
+        }
 
         // Withdrawn from hid while the Controllers screen is open, as the screen does with every controller;
         // the link stays up and the controller comes back on LB+RB (any button once the screen is closed)
@@ -69,8 +83,6 @@ namespace ams::ble {
         constexpr s64 NeutralReportDelaysMs[NeutralReportCount] = { 0, 300, 1000, 2500 };
         constinit s64 g_neutral_due[NeutralReportCount] = {};
 
-        constexpr u8 NeutralReport[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
-
         void ScheduleNeutralReports() {
             const s64 now = os::GetSystemTick().GetInt64Value();
             std::scoped_lock lk(g_controller_lock);
@@ -80,7 +92,7 @@ namespace ams::ble {
         }
 
         void ServiceNeutralReports() {
-            std::shared_ptr<controller::XboxOneBleController> controller;
+            std::shared_ptr<controller::BleHidController> controller;
             bool due = false;
             {
                 std::scoped_lock lk(g_controller_lock);
@@ -96,38 +108,19 @@ namespace ams::ble {
                 }
             }
             if (controller) {
-                static_cast<void>(controller->HandleInputReport(NeutralReport, sizeof(NeutralReport)));
+                static_cast<void>(controller->HandleNeutralReport());
             }
-        }
-
-        /* Report layout on the LE HID stream: XboxOneInputReport0x01 without the report id */
-        constexpr size_t ReportOffsetTriggers = 8;
-        constexpr size_t ReportOffsetDpad     = 12;
-        constexpr size_t ReportOffsetButtons  = 13;
-        constexpr u8 ReportButtonsLbRb        = 0xC0;
-
-        bool ReportHasLbRb(const u8 *data, size_t size) {
-            return (size > ReportOffsetButtons) && ((data[ReportOffsetButtons] & ReportButtonsLbRb) == ReportButtonsLbRb);
-        }
-
-        bool ReportHasAnyInput(const u8 *data, size_t size) {
-            for (size_t i = ReportOffsetTriggers; i < std::min(size, sizeof(controller::XboxOneInputReport0x01)); ++i) {
-                if (data[i] != 0) {
-                    return true;
-                }
-            }
-            return false;
         }
 
         void Unpark() {
-            std::shared_ptr<controller::XboxOneBleController> controller;
+            std::shared_ptr<controller::SwitchController> controller;
             {
                 std::scoped_lock lk(g_controller_lock);
-                if (!g_parked || !g_controller) {
+                if (!g_parked || !g_switch_controller) {
                     return;
                 }
                 g_parked = false;
-                controller = g_controller;
+                controller = g_switch_controller;
             }
             controller::ReattachVirtualController(controller);
             ScheduleNeutralReports();
@@ -170,9 +163,10 @@ namespace ams::ble {
             }
         }
 
-        // The name only travels in the scan response, which isn't always reported
-        bool IsXboxController(const AdvertisementSummary &summary) {
-            return (std::strncmp(summary.name, "Xbox", 4) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad));
+        // The name only travels in the scan response, which isn't always reported. Which driver a pad gets is
+        // decided later from its HID Report Map, see NoteReportMap.
+        bool IsSupportedController(const AdvertisementSummary &summary) {
+            return (std::strncmp(summary.name, "Xbox", 4) == 0) || (std::strncmp(summary.name, "8BitDo", 6) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad));
         }
 
         /* LE HID event stream: notifications from services registered with RegisterGattHidDataPath, and the results
@@ -206,7 +200,7 @@ namespace ams::ble {
 
                 if ((notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
                     const size_t size = std::min<size_t>(notify.size, sizeof(notify.data));
-                    std::shared_ptr<controller::XboxOneBleController> controller;
+                    std::shared_ptr<controller::BleHidController> controller;
                     bool parked;
                     {
                         std::scoped_lock lk(g_controller_lock);
@@ -215,7 +209,7 @@ namespace ams::ble {
                     }
                     if (parked) {
                         // What brings a controller back on the Controllers screen is L+R; afterwards any button does
-                        if (ReportHasLbRb(notify.data, size) || (!events::IsPairingWindowOpen() && ReportHasAnyInput(notify.data, size))) {
+                        if (controller && (controller->ReportHasShoulderButtons(notify.data, size) || (!events::IsPairingWindowOpen() && controller->ReportHasAnyInput(notify.data, size)))) {
                             Unpark();
                         } else {
                             continue;
@@ -225,6 +219,9 @@ namespace ams::ble {
                         static_cast<void>(controller->HandleInputReport(notify.data, size));
                     }
                 } else {
+                    if ((notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReportMap)) {
+                        NoteReportMap(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
+                    }
                     events::NoteGattResult(notify.result);
                     events::Log(g_le_hid_record);
                 }
@@ -523,7 +520,7 @@ namespace ams::ble {
                 }
                 AdvertisementSummary summary;
                 ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
-                return IsXboxController(summary);
+                return IsSupportedController(summary);
             });
 
             static_cast<void>(btdrvStopBleScan());
@@ -640,10 +637,21 @@ namespace ams::ble {
                 log::Write("no output Report characteristic, rumble unavailable");
             }
 
-            auto controller = std::make_shared<controller::XboxOneBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
+            std::shared_ptr<controller::BleHidController> ble_controller;
+            std::shared_ptr<controller::SwitchController> controller;
+            if (g_controller_kind == ControllerKind_EightBitDo) {
+                auto c = std::make_shared<controller::EightBitDoBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
+                ble_controller = c;
+                controller = c;
+            } else {
+                auto c = std::make_shared<controller::XboxOneBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
+                ble_controller = c;
+                controller = c;
+            }
             {
                 std::scoped_lock lk(g_controller_lock);
-                g_controller = controller;
+                g_controller = ble_controller;
+                g_switch_controller = controller;
                 g_parked = false;
                 g_present_tick = os::GetSystemTick().GetInt64Value();
             }
@@ -660,11 +668,12 @@ namespace ams::ble {
         }
 
         void Dismiss(const bluetooth::Address &address) {
-            std::shared_ptr<controller::XboxOneBleController> controller;
+            std::shared_ptr<controller::SwitchController> controller;
             bool parked;
             {
                 std::scoped_lock lk(g_controller_lock);
-                controller = std::move(g_controller);
+                controller = std::move(g_switch_controller);
+                g_switch_controller = nullptr;
                 g_controller = nullptr;
                 parked = g_parked;
                 g_parked = false;
@@ -802,6 +811,7 @@ namespace ams::ble {
 
                 // The subscription is judged by the CCCD write's result; the pad only reports on input
                 events::ClearGattFailure();
+                g_controller_kind = ControllerKind_Xbox;
                 gatt::HidService hid;
                 rc = gatt::Subscribe(conn_id, &hid);
                 if (R_FAILED(rc)) {
@@ -877,14 +887,14 @@ namespace ams::ble {
             return;
         }
 
-        std::shared_ptr<controller::XboxOneBleController> controller;
+        std::shared_ptr<controller::SwitchController> controller;
         {
             std::scoped_lock lk(g_controller_lock);
-            if (!g_controller || g_parked || ((now - os::Tick(g_present_tick)).ToTimeSpan() < NewSessionGap)) {
+            if (!g_switch_controller || g_parked || ((now - os::Tick(g_present_tick)).ToTimeSpan() < NewSessionGap)) {
                 return;
             }
             g_parked = true;
-            controller = g_controller;
+            controller = g_switch_controller;
             for (auto &due : g_neutral_due) {
                 due = 0;
             }

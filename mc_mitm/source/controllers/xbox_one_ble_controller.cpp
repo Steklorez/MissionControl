@@ -23,6 +23,14 @@ namespace ams::controller {
         // HOGP strips report ids from the data; the input report we forward is report 0x01
         constexpr u8 InputReportId = 0x01;
 
+        // Sticks centred, nothing pressed
+        constexpr u8 NeutralReport[sizeof(XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
+
+        /* Offsets into the input report payload (XboxOneInputReport0x01 without the report id) */
+        constexpr size_t ReportOffsetTriggers = 8;
+        constexpr size_t ReportOffsetButtons  = 13;
+        constexpr u8 ReportButtonsLbRb        = 0xC0;
+
     }
 
     Result XboxOneBleController::HandleInputReport(const u8 *data, size_t size) {
@@ -41,6 +49,23 @@ namespace ams::controller {
         std::memcpy(&event.report.data[1], data, size);
 
         R_RETURN(XboxOneController::HandleDataReportEvent(&m_event_info));
+    }
+
+    Result XboxOneBleController::HandleNeutralReport() {
+        R_RETURN(this->HandleInputReport(NeutralReport, sizeof(NeutralReport)));
+    }
+
+    bool XboxOneBleController::ReportHasShoulderButtons(const u8 *data, size_t size) const {
+        return (size > ReportOffsetButtons) && ((data[ReportOffsetButtons] & ReportButtonsLbRb) == ReportButtonsLbRb);
+    }
+
+    bool XboxOneBleController::ReportHasAnyInput(const u8 *data, size_t size) const {
+        for (size_t i = ReportOffsetTriggers; i < std::min(size, sizeof(XboxOneInputReport0x01)); ++i) {
+            if (data[i] != 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void XboxOneBleController::ProcessInputData(const bluetooth::HidReport *report) {
