@@ -14,6 +14,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "bluetooth_hid_report.hpp"
+#include "../../ble/ble_log.hpp"
 #include "bluetooth_circular_buffer.hpp"
 #include "../btdrv_shim.h"
 #include "../btdrv_mitm_flags.hpp"
@@ -131,6 +132,7 @@ namespace ams::bluetooth::hid::report {
         g_real_bt_shmem.Attach(BluetoothSharedMemorySize, handle, true);
         g_real_bt_shmem.Map(os::MemoryPermission_ReadWrite);
         g_real_buffer = reinterpret_cast<bluetooth::CircularBuffer *>(g_real_bt_shmem.GetMappedAddress());
+        ams::ble::log::Write("hid report shared memory mapped at %p", static_cast<void *>(g_real_buffer));
 
         R_SUCCEED();
     }

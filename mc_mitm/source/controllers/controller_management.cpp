@@ -233,6 +233,11 @@ namespace ams::controller {
     }
 
     void AttachHandler(bluetooth::Address address) {
+        // A controller can report Opened again without its earlier connection having reported Closed (the stack
+        // was restarted under it). The stale handler still holds the controller's settings files, so it goes
+        // first; otherwise the new one fails to open them and a late Closed removes the working one instead.
+        RemoveHandler(address);
+
         bluetooth::DevicesSettings device_settings;
         R_ABORT_UNLESS(btdrvGetPairedDeviceInfo(address, &device_settings));
 
@@ -399,6 +404,31 @@ namespace ams::controller {
         }
 
         mitm::btm::condition::Signal();
+    }
+
+    // Drops the handlers of controllers connected through the stack (not the virtual Bluetooth LE ones), whose
+    // connections are gone once the stack has been restarted
+    size_t RemovePhysicalHandlers() {
+        std::scoped_lock lk(g_controller_lock);
+
+        size_t removed = 0;
+        for (auto it = g_controllers.begin(); it < g_controllers.end();) {
+            const bool is_virtual = std::any_of(g_virtual_devices.begin(), g_virtual_devices.end(), [&](const bluetooth::Address &address) {
+                return utils::BluetoothAddressCompare(address, (*it)->Address());
+            });
+            if (is_virtual) {
+                ++it;
+            } else {
+                it = g_controllers.erase(it);
+                ++removed;
+            }
+        }
+        return removed;
+    }
+
+    size_t GetControllerCount() {
+        std::scoped_lock lk(g_controller_lock);
+        return g_controllers.size();
     }
 
     size_t GetVirtualDevices(bluetooth::Address *out, size_t max) {

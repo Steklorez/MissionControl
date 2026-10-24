@@ -35,6 +35,7 @@ namespace ams::controller {
             Result EnsureInitialized();
 
             fs::FileHandle m_virtual_memory_file;
+            bool m_open = false;
     };
 
 }

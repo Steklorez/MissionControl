@@ -32,7 +32,9 @@ namespace ams::controller {
     }
 
     VirtualSpiFlash::~VirtualSpiFlash() {
-        fs::CloseFile(m_virtual_memory_file);
+        if (m_open) {
+            fs::CloseFile(m_virtual_memory_file);
+        }
     }
 
     Result VirtualSpiFlash::Initialize(const char *path) {
@@ -45,6 +47,7 @@ namespace ams::controller {
 
         // Open the virtual spi flash file for read and write
         R_TRY(fs::OpenFile(std::addressof(m_virtual_memory_file), path, fs::OpenMode_ReadWrite));
+        m_open = true;
 
         // Make sure that all memory regions that we care about are initialised with defaults
         R_TRY(this->EnsureInitialized());
@@ -52,15 +55,20 @@ namespace ams::controller {
         R_SUCCEED();
     }
 
+    // The file is not open if Initialize failed (it was still held by a previous handler for the same
+    // controller); hid's requests then fail instead of dereferencing a null handle
     Result VirtualSpiFlash::Read(int offset, void *data, size_t size) {
+        R_UNLESS(m_open, svc::ResultInvalidState());
         R_RETURN(fs::ReadFile(m_virtual_memory_file, offset, data, size));
     }
 
     Result VirtualSpiFlash::Write(int offset, const void *data, size_t size) {
+        R_UNLESS(m_open, svc::ResultInvalidState());
         R_RETURN(fs::WriteFile(m_virtual_memory_file, offset, data, size, fs::WriteOption::Flush));
     }
 
     Result VirtualSpiFlash::SectorErase(int offset) {
+        R_UNLESS(m_open, svc::ResultInvalidState());
         u8 buff[64];
         std::memset(buff, 0xff, sizeof(buff));
 

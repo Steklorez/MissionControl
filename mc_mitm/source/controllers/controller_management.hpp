@@ -103,5 +103,7 @@ namespace ams::controller {
     // Attach again a controller detached earlier in the same connection (its storage is already initialised)
     void ReattachVirtualController(std::shared_ptr<SwitchController> controller);
     size_t GetVirtualDevices(bluetooth::Address *out, size_t max);
+    size_t GetControllerCount();
+    size_t RemovePhysicalHandlers();
 
 }

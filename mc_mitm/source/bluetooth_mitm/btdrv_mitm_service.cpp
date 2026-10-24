@@ -30,6 +30,7 @@
 namespace ams::mitm::bluetooth {
 
     Result BtdrvMitmService::InitializeBluetooth(sf::OutCopyHandle out_handle) {
+        ams::ble::log::Write("btdrv InitializeBluetooth from program 0x%016lx", m_client_info.program_id.value);
         if (!ams::bluetooth::core::IsInitialized()) {
             // Forward to the real function to obtain the system event handle
             os::NativeHandle handle = os::InvalidNativeHandle;
@@ -54,6 +55,19 @@ namespace ams::mitm::bluetooth {
     }
 
     Result BtdrvMitmService::EnableBluetooth() {
+        ams::ble::log::Write("btdrv EnableBluetooth from program 0x%016lx", m_client_info.program_id.value);
+
+        // btm enables Bluetooth again after the stack was restarted (a BluetoothCrash, as the BLE host requests).
+        // Every connection made through the stack is gone by then, without each having reported Closed; their
+        // handlers would otherwise linger and clash with the ones created when the controllers reconnect.
+        static constinit bool s_enabled_before = false;
+        if (s_enabled_before) {
+            if (size_t removed = controller::RemovePhysicalHandlers(); removed > 0) {
+                ams::ble::log::Write("stack restarted, dropped %u stale controller handler(s)", static_cast<u32>(removed));
+            }
+        }
+        s_enabled_before = true;
+
         R_TRY(btdrvEnableBluetoothFwd(m_forward_service.get()));
         ams::bluetooth::core::SignalEnabled();
 
@@ -68,6 +82,7 @@ namespace ams::mitm::bluetooth {
     }
 
     Result BtdrvMitmService::InitializeHid(sf::OutCopyHandle out_handle, u16 version) {
+        ams::ble::log::Write("btdrv InitializeHid from program 0x%016lx", m_client_info.program_id.value);
         if (!ams::bluetooth::hid::IsInitialized()) {
             // Forward to the real function to obtain the system event handle
             os::NativeHandle handle = os::InvalidNativeHandle;
@@ -121,6 +136,7 @@ namespace ams::mitm::bluetooth {
     }
 
     Result BtdrvMitmService::RegisterHidReportEvent(sf::OutCopyHandle out_handle) {
+        ams::ble::log::Write("btdrv RegisterHidReportEvent from program 0x%016lx", m_client_info.program_id.value);
         if (!ams::bluetooth::hid::report::IsInitialized()) {
             // Forward to the real function to obtain the system event handle
             os::NativeHandle handle = os::InvalidNativeHandle;
@@ -142,6 +158,7 @@ namespace ams::mitm::bluetooth {
     }
 
     Result BtdrvMitmService::GetHidReportEventInfo(sf::OutCopyHandle out_handle) {
+        ams::ble::log::Write("btdrv GetHidReportEventInfo from program 0x%016lx", m_client_info.program_id.value);
         os::NativeHandle handle = os::InvalidNativeHandle;
         R_TRY(btdrvGetHidReportEventInfoFwd(m_forward_service.get(), &handle));
         R_TRY(ams::bluetooth::hid::report::MapRemoteSharedMemory(handle));
@@ -151,6 +168,7 @@ namespace ams::mitm::bluetooth {
     }
 
     Result BtdrvMitmService::InitializeBle(sf::OutCopyHandle out_handle) {
+        ams::ble::log::Write("btdrv InitializeBle from program 0x%016lx", m_client_info.program_id.value);
         if (!ams::bluetooth::ble::IsInitialized()) {
             // Forward to the real function to obtain the system event handle
             os::NativeHandle handle = os::InvalidNativeHandle;
