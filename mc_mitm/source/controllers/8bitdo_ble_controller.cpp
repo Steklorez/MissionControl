@@ -15,6 +15,7 @@
  */
 #include "8bitdo_ble_controller.hpp"
 #include "controller_utils.hpp"
+#include "../ble/ble_log.hpp"
 #include <stratosphere.hpp>
 
 namespace ams::controller {
@@ -126,9 +127,40 @@ namespace ams::controller {
 
         m_buttons.home = src->buttons.home;
 
+        // The back paddles have no counterpart on a Switch controller; they step the console volume
+        this->HandleVolumeButtons(src->buttons.L4, src->buttons.R4);
+
         if (report->size >= sizeof(EightBitDoBleInputReport0x01) + 1) {
             m_battery = convert_battery_100(std::min<u8>(src->battery, 100));
         }
+    }
+
+    void EightBitDoBleController::HandleVolumeButtons(bool down, bool up) {
+        const int step = (down && !m_volume_down) ? -1 : (up && !m_volume_up) ? 1 : 0;
+        m_volume_down = down;
+        m_volume_up = up;
+        if (step == 0) {
+            return;
+        }
+
+        static bool initialized = false;
+        if (!initialized) {
+            Result rc = audctlInitialize();
+            initialized = R_SUCCEEDED(rc);
+            if (!initialized) {
+                ble::log::Write("audctlInitialize rc=0x%x", rc.GetValue());
+                return;
+            }
+        }
+
+        AudioTarget target = AudioTarget_Invalid;
+        s32 volume = 0, min = 0, max = 0;
+        Result rc = audctlGetActiveOutputTarget(&target);
+        if (R_SUCCEEDED(rc)) rc = audctlGetTargetVolume(&volume, target);
+        if (R_SUCCEEDED(rc)) rc = audctlGetTargetVolumeMin(&min);
+        if (R_SUCCEEDED(rc)) rc = audctlGetTargetVolumeMax(&max);
+        if (R_SUCCEEDED(rc)) rc = audctlSetTargetVolume(target, std::clamp<s32>(volume + step, min, max));
+        ble::log::Write("volume %+d: target=%d volume=%d range=%d..%d rc=0x%x", step, target, volume, min, max, rc.GetValue());
     }
 
     Result EightBitDoBleController::SetVibration(const SwitchMotorData *motor_data) {
@@ -141,6 +173,12 @@ namespace ams::controller {
 
     Result EightBitDoBleController::CancelVibration() {
         R_RETURN(this->WriteRumble(0, 0));
+    }
+
+    void EightBitDoBleController::StopRumble() {
+        // Sent even if the last write already was a stop, in case that one was lost
+        m_last_rumble_strong = UINT8_MAX;
+        static_cast<void>(this->WriteRumble(0, 0));
     }
 
     Result EightBitDoBleController::WriteRumble(u8 strong, u8 weak) {

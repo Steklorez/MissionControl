@@ -37,6 +37,9 @@ namespace ams::controller {
             virtual bool ReportHasShoulderButtons(const u8 *data, size_t size) const = 0;
 
             virtual bool ReportHasAnyInput(const u8 *data, size_t size) const = 0;
+
+            // Rumble the system started is not stopped by it once the controller has been withdrawn
+            virtual void StopRumble() { }
     };
 
 }

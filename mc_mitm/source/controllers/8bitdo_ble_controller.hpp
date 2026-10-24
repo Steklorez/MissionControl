@@ -38,7 +38,9 @@ namespace ams::controller {
         u8 R3     : 1;
         u8        : 1;
 
-        u8 _unk;
+        u8 L4     : 1;
+        u8 R4     : 1;
+        u8        : 6;
     } PACKED;
 
     // Input report 0x01 as delivered over HID-over-GATT (report id stripped)
@@ -84,6 +86,7 @@ namespace ams::controller {
             Result HandleNeutralReport() override;
             bool ReportHasShoulderButtons(const u8 *data, size_t size) const override;
             bool ReportHasAnyInput(const u8 *data, size_t size) const override;
+            void StopRumble() override;
 
         protected:
             void ProcessInputData(const bluetooth::HidReport *report) override;
@@ -92,6 +95,7 @@ namespace ams::controller {
 
         private:
             Result WriteRumble(u8 strong, u8 weak);
+            void HandleVolumeButtons(bool down, bool up);
 
             u32 m_conn_id;
             BtdrvGattId m_service_id;
@@ -100,6 +104,9 @@ namespace ams::controller {
 
             u8 m_last_rumble_strong = 0;
             u8 m_last_rumble_weak = 0;
+
+            bool m_volume_down = false;
+            bool m_volume_up = false;
 
             bluetooth::HidReportEventInfo m_event_info;
     };

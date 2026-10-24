@@ -104,8 +104,20 @@ namespace ams::ble::gatt {
 
         // The stack runs discovery on its own shortly after connecting (its first cache report arrives within a
         // second); wait for that rather than a fixed two seconds, then let the remaining reports trail in
-        events::WaitFor(BtdrvBleEventType_ClientCacheSave, TimeSpan::FromSeconds(2), nullptr, [&](const EventRecord &r) { return r.info.client_cache_save.conn_id == conn_id; });
-        events::Pump(TimeSpan::FromMilliSeconds(400));
+        // A link that drops right after coming up (0x3e) ends the waits at once; the caller retries
+        if (!events::IsDisconnected()) {
+            events::WaitFor(events::InvalidType, TimeSpan::FromSeconds(2), nullptr, [&](const EventRecord &r) {
+                return events::IsDisconnected() || ((r.type == BtdrvBleEventType_ClientCacheSave) && (r.info.client_cache_save.conn_id == conn_id));
+            });
+        }
+        if (!events::IsDisconnected()) {
+            events::Pump(TimeSpan::FromMilliSeconds(400));
+        }
+        if (events::IsDisconnected()) {
+            g_discovery_complete = true;
+            g_replace_pending = false;
+            return;
+        }
 
         Result rc = btdrvGetGattAttribute(address, conn_id);
         log::Write("btdrvGetGattAttribute rc=0x%x", rc.GetValue());
@@ -114,8 +126,12 @@ namespace ams::ble::gatt {
         log::Write("btdrvConfigureAttMtu rc=0x%x", rc.GetValue());
 
         // The MTU result is the last thing the stack reports for a fresh link
-        events::WaitFor(BtdrvBleEventType_ClientConfigureMtu, TimeSpan::FromSeconds(5), nullptr, [&](const EventRecord &r) { return r.info.client_configure_mtu.conn_id == conn_id; });
-        events::Pump(TimeSpan::FromMilliSeconds(500));
+        events::WaitFor(events::InvalidType, TimeSpan::FromSeconds(5), nullptr, [&](const EventRecord &r) {
+            return events::IsDisconnected() || ((r.type == BtdrvBleEventType_ClientConfigureMtu) && (r.info.client_configure_mtu.conn_id == conn_id));
+        });
+        if (!events::IsDisconnected()) {
+            events::Pump(TimeSpan::FromMilliSeconds(500));
+        }
 
         g_discovery_complete = true;
         g_replace_pending = false;

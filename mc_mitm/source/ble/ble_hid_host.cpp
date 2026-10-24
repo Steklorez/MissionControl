@@ -187,6 +187,12 @@ namespace ams::ble {
             if (!controller) {
                 return;
             }
+            // Debug: raw button bytes whenever they change, to map the extra buttons
+            static u8 last_buttons[6];
+            if ((size >= 13) && (std::memcmp(last_buttons, &data[7], sizeof(last_buttons)) != 0)) {
+                std::memcpy(last_buttons, &data[7], sizeof(last_buttons));
+                log::Write("buttons %02x %02x %02x | %02x %02x %02x", data[7], data[8], data[9], data[10], data[11], data[12]);
+            }
             if (parked) {
                 // What brings a controller back on the Controllers screen is L+R; afterwards any button does
                 if (controller->ReportHasShoulderButtons(data, size) || (!events::IsPairingWindowOpen() && controller->ReportHasAnyInput(data, size))) {
@@ -333,9 +339,13 @@ namespace ams::ble {
 
         constexpr const char LastDevicePath[] = "sdmc:/config/MissionControl/ble_last_device.bin";
 
+        // Most recently connected first; a new controller pushes the oldest one out
+        constexpr size_t MaxRememberedDevices = 4;
+
         constinit os::SdkMutex g_autoconnect_lock;
         constinit bool g_have_remembered = false;
-        constinit bluetooth::Address g_remembered = {};
+        constinit size_t g_remembered_count = 0;
+        constinit bluetooth::Address g_remembered[MaxRememberedDevices] = {};
 
         bool AutoConnectEnabled() {
             return mitm::GetGlobalConfig()->ble.auto_connect;
@@ -353,28 +363,43 @@ namespace ams::ble {
             }
             ON_SCOPE_EXIT { fs::CloseFile(file); };
 
-            bluetooth::Address address;
+            bluetooth::Address addresses[MaxRememberedDevices];
             size_t read = 0;
-            if (R_FAILED(fs::ReadFile(std::addressof(read), file, 0, std::addressof(address), sizeof(address))) || (read != sizeof(address))) {
+            if (R_FAILED(fs::ReadFile(std::addressof(read), file, 0, addresses, sizeof(addresses))) || (read < sizeof(bluetooth::Address))) {
                 return;
             }
 
+            const size_t count = read / sizeof(bluetooth::Address);
             {
                 std::scoped_lock lk(g_autoconnect_lock);
-                g_remembered = address;
+                std::memcpy(g_remembered, addresses, count * sizeof(bluetooth::Address));
+                g_remembered_count = count;
                 g_have_remembered = true;
             }
-            events::RememberAttempted(&address);
-            events::LogAddress("auto-connect: remembered controller", address);
+            events::RememberAttempted(&addresses[0]);
+            for (size_t i = 0; i < count; ++i) {
+                events::LogAddress("auto-connect: remembered controller", addresses[i]);
+            }
         }
 
         void SaveRememberedDevice(const bluetooth::Address &address) {
+            bluetooth::Address addresses[MaxRememberedDevices];
+            size_t count;
             {
                 std::scoped_lock lk(g_autoconnect_lock);
-                if (g_have_remembered && AddressEqual(g_remembered, address)) {
+                if (g_have_remembered && AddressEqual(g_remembered[0], address)) {
                     return;
                 }
-                g_remembered = address;
+                // Move it to the front, dropping its older entry or the oldest controller
+                size_t n = 0;
+                addresses[n++] = address;
+                for (size_t i = 0; (i < g_remembered_count) && (n < MaxRememberedDevices); ++i) {
+                    if (!AddressEqual(g_remembered[i], address)) {
+                        addresses[n++] = g_remembered[i];
+                    }
+                }
+                std::memcpy(g_remembered, addresses, n * sizeof(bluetooth::Address));
+                g_remembered_count = count = n;
                 g_have_remembered = true;
             }
 
@@ -382,24 +407,27 @@ namespace ams::ble {
                 return;
             }
 
-            static_cast<void>(fs::CreateFile(LastDevicePath, sizeof(address)));
+            const size_t size = count * sizeof(bluetooth::Address);
+            static_cast<void>(fs::CreateFile(LastDevicePath, size));
             fs::FileHandle file;
             if (R_FAILED(fs::OpenFile(std::addressof(file), LastDevicePath, fs::OpenMode_Write))) {
                 log::Write("auto-connect: could not save the controller");
                 return;
             }
             ON_SCOPE_EXIT { fs::CloseFile(file); };
-            static_cast<void>(fs::SetFileSize(file, sizeof(address)));
-            static_cast<void>(fs::WriteFile(file, 0, std::addressof(address), sizeof(address), fs::WriteOption::Flush));
+            static_cast<void>(fs::SetFileSize(file, size));
+            static_cast<void>(fs::WriteFile(file, 0, addresses, size, fs::WriteOption::Flush));
             events::LogAddress("auto-connect: saved controller", address);
         }
 
-        bool GetRememberedDevice(bluetooth::Address *out) {
+        bool IsRememberedDevice(const bluetooth::Address &address) {
             std::scoped_lock lk(g_autoconnect_lock);
-            if (g_have_remembered) {
-                *out = g_remembered;
+            for (size_t i = 0; i < g_remembered_count; ++i) {
+                if (AddressEqual(g_remembered[i], address)) {
+                    return true;
+                }
             }
-            return g_have_remembered;
+            return false;
         }
 
         // A background connection request (ConnectGattServer with is_direct=false) was tried first: the stack
@@ -435,6 +463,10 @@ namespace ams::ble {
             }
 
             events::ClearSpareClientIf();
+
+            // Other controllers drop with the stack and reconnect on their own button; mc.mitm drops their stale
+            // handlers when btm enables Bluetooth again (see BtdrvMitmService::EnableBluetooth)
+            log::Write("radio cycle with %u other controller(s) connected", static_cast<u32>(controller::GetControllerCount()));
 
             Result rc = btdrvEmulateBluetoothCrash(BtdrvFatalReason_Unknown1);
             log::Write("radio cycle: btdrvEmulateBluetoothCrash rc=0x%x", rc.GetValue());
@@ -476,7 +508,7 @@ namespace ams::ble {
         /* Finding and connecting the controller */
 
         // With `only` set, nothing but that controller is accepted (background scans outside the pairing window)
-        Result Scan(bluetooth::Address *out_address, TimeSpan duration, const bluetooth::Address *only = nullptr) {
+        Result Scan(bluetooth::Address *out_address, TimeSpan duration, bool only_remembered = false) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -519,15 +551,15 @@ namespace ams::ble {
 
             EventRecord e;
             // Ends early if a link came up by itself or the console is going to sleep
-            const bool found = events::WaitFor(events::InvalidType, duration, &e, [only](const EventRecord &r) {
+            const bool found = events::WaitFor(events::InvalidType, duration, &e, [only_remembered](const EventRecord &r) {
                 if (r.type != BtdrvBleEventType_ScanResult) {
                     return events::HasAdoptedConnection() || !events::IsRadioEnabled();
                 }
                 if (r.info.scan_result.status != BleScanStatus_NewDevice) {
                     return false;
                 }
-                if (only) {
-                    return AddressEqual(r.info.scan_result.address, *only);
+                if (only_remembered) {
+                    return IsRememberedDevice(r.info.scan_result.address);
                 }
                 AdvertisementSummary summary;
                 ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
@@ -782,11 +814,10 @@ namespace ams::ble {
 
                 // Any gamepad in pairing mode while the Controllers screen is open; only the remembered one,
                 // in short bursts, the rest of the time
-                bluetooth::Address remembered;
                 const bool in_window = events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive();
-                const bool background = !in_window && !PairingBackoffActive() && BackgroundScanWanted() && GetRememberedDevice(&remembered);
+                const bool background = !in_window && !PairingBackoffActive() && BackgroundScanWanted();
                 if (!connected && (in_window || background)) {
-                    Result rc = in_window ? Scan(&address, TimeSpan::FromSeconds(10)) : Scan(&address, BackgroundScanDuration, &remembered);
+                    Result rc = in_window ? Scan(&address, TimeSpan::FromSeconds(10)) : Scan(&address, BackgroundScanDuration, true);
                     if (Adopt(&address, &conn_id)) {
                         connected = true;
                     } else if (R_SUCCEEDED(rc)) {
@@ -939,11 +970,19 @@ namespace ams::ble {
             return;
         }
 
+        // The screen is only inferred from btm's inquiry and was seen to withdraw the controller again right after
+        // LB+RB brought it back; it read as the controller dropping off the console. Left connected instead.
+        constexpr bool WithdrawOnControllersScreen = false;
+        if (!WithdrawOnControllersScreen) {
+            return;
+        }
+
         if ((s_last_close_tick != 0) && ((now - os::Tick(s_last_close_tick)).ToTimeSpan() < NewSessionGap)) {
             return;
         }
 
         std::shared_ptr<controller::SwitchController> controller;
+        std::shared_ptr<controller::BleHidController> ble_controller;
         {
             std::scoped_lock lk(g_controller_lock);
             if (!g_switch_controller || g_parked || ((now - os::Tick(g_present_tick)).ToTimeSpan() < NewSessionGap)) {
@@ -951,9 +990,13 @@ namespace ams::ble {
             }
             g_parked = true;
             controller = g_switch_controller;
+            ble_controller = g_controller;
             for (auto &due : g_neutral_due) {
                 due = 0;
             }
+        }
+        if (ble_controller) {
+            ble_controller->StopRumble();
         }
         controller::DetachVirtualController(controller->Address());
         log::Write("controller withdrawn while the Controllers screen is open, LB+RB brings it back");
