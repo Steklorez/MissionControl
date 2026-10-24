@@ -65,6 +65,9 @@ namespace ams::ble {
         };
         constinit ControllerKind g_controller_kind = ControllerKind_Xbox;
 
+        // Set while the HID service is registered as a managed data path (8BitDo pads)
+        constinit bool g_managed_path = false;
+
         // 00010203-0405-0607-0809-0a0b0c0d1912, as the stack reports it
         constexpr u8 EightBitDoVendorService[0x10] = { 0x12, 0x19, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00 };
 
@@ -717,6 +720,11 @@ namespace ams::ble {
             events::SetClaimedAddress(nullptr);
             events::SetInputSink(nullptr);
             events::SetCountManagedGattResults(false);
+            if (g_managed_path) {
+                auto hid_uuid = MakeUuid16(GattServiceHid);
+                static_cast<void>(btdrvUnregisterGattManagedDataPath(&hid_uuid));
+                g_managed_path = false;
+            }
         }
 
         void RunConnected(u32 conn_id) {
@@ -802,6 +810,14 @@ namespace ams::ble {
 
                 gatt::Discover(conn_id, address);
 
+                // A link that drops as soon as it comes up (0x3e) leaves nothing to tell the pad by; just try again
+                if (events::IsDisconnected()) {
+                    log::Write("link lost during discovery reason=0x%04x", events::GetDisconnectReason());
+                    Disconnect();
+                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    continue;
+                }
+
                 // 8BitDo pads carry a vendor service of their own next to the HID one
                 g_controller_kind = gatt::HasService128(EightBitDoVendorService) ? ControllerKind_EightBitDo : ControllerKind_Xbox;
                 log::Write("%s controller", (g_controller_kind == ControllerKind_EightBitDo) ? "8BitDo" : "Xbox");
@@ -830,9 +846,14 @@ namespace ams::ble {
                 const bool managed = (g_controller_kind == ControllerKind_EightBitDo);
                 events::SetCountManagedGattResults(managed);
                 events::SetInputSink(managed ? DeliverInputReport : nullptr);
-                Result rc = ResultSuccess();
-                if (!managed) {
-                    auto hid_uuid = MakeUuid16(GattServiceHid);
+                auto hid_uuid = MakeUuid16(GattServiceHid);
+                Result rc;
+                if (managed) {
+                    // Without a data path the stack reports nothing about the service at all
+                    rc = btdrvRegisterGattManagedDataPath(&hid_uuid);
+                    log::Write("btdrvRegisterGattManagedDataPath rc=0x%x", rc.GetValue());
+                    g_managed_path = R_SUCCEEDED(rc);
+                } else {
                     rc = btdrvRegisterGattHidDataPath(&hid_uuid);
                     log::Write("btdrvRegisterGattHidDataPath rc=0x%x", rc.GetValue());
                 }
