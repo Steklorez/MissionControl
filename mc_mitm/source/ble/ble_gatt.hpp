@@ -50,6 +50,9 @@ namespace ams::ble::gatt {
 
     // Enables notifications on the HID input Report characteristic(s). Fails with InsufficientAuthentication
     // when the link isn't encrypted; returns NotFound if the table holds no HID service.
-    Result Subscribe(u32 conn_id, HidService *out);
+    Result Subscribe(u32 conn_id, HidService *out, BtdrvGattAuthReqType auth = BtdrvGattAuthReqType_NoMitm);
+
+    // Whether the table holds a primary service with this 128-bit UUID (bytes as the stack reports them)
+    bool HasService128(const u8 (&uuid)[0x10]);
 
 }

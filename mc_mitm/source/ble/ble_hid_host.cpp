@@ -58,16 +58,19 @@ namespace ams::ble {
         std::shared_ptr<controller::BleHidController> g_controller;
         std::shared_ptr<controller::SwitchController> g_switch_controller;
 
-        // Which driver the connected pad gets, told apart by the HID Report Map read while subscribing
+        // Which driver the connected pad gets, told apart by its services once discovered
         enum ControllerKind {
             ControllerKind_Xbox,
             ControllerKind_EightBitDo,
         };
         constinit ControllerKind g_controller_kind = ControllerKind_Xbox;
 
+        // 00010203-0405-0607-0809-0a0b0c0d1912, as the stack reports it
+        constexpr u8 EightBitDoVendorService[0x10] = { 0x12, 0x19, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00 };
+
         void NoteReportMap(const u8 *map, size_t size) {
-            g_controller_kind = controller::EightBitDoBleController::MatchesReportMap(map, size) ? ControllerKind_EightBitDo : ControllerKind_Xbox;
-            log::Write("report map size=%u, %s controller", static_cast<u32>(size), (g_controller_kind == ControllerKind_EightBitDo) ? "8BitDo" : "Xbox");
+            const bool eightbitdo = controller::EightBitDoBleController::MatchesReportMap(map, size);
+            log::Write("report map size=%u%s", static_cast<u32>(size), eightbitdo ? ", 8BitDo layout" : "");
         }
 
         // Withdrawn from hid while the Controllers screen is open, as the screen does with every controller;
@@ -792,15 +795,25 @@ namespace ams::ble {
 
                 gatt::Discover(conn_id, address);
 
-                if (!Pair(address)) {
-                    g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
-                    log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
-                    Disconnect();
-                    // A cycle clears the backoff: the next attempt is against a fresh stack. A connection asked for
-                    // within a couple of seconds of the cycle fails to be established (0x3e), so let it settle.
-                    RecycleRadio();
-                    os::SleepThread(TimeSpan::FromSeconds(3));
-                    continue;
+                // 8BitDo pads carry a vendor service of their own next to the HID one
+                g_controller_kind = gatt::HasService128(EightBitDoVendorService) ? ControllerKind_EightBitDo : ControllerKind_Xbox;
+                log::Write("%s controller", (g_controller_kind == ControllerKind_EightBitDo) ? "8BitDo" : "Xbox");
+
+                // EXPERIMENT. An 8BitDo pad answers the console's LE legacy pairing at once and then serves nothing
+                // that needs encryption; see whether it serves its HID service without, before pairing at all
+                bool paired = false;
+                if (g_controller_kind != ControllerKind_EightBitDo) {
+                    if (!Pair(address)) {
+                        g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
+                        log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
+                        Disconnect();
+                        // A cycle clears the backoff: the next attempt is against a fresh stack. A connection asked for
+                        // within a couple of seconds of the cycle fails to be established (0x3e), so let it settle.
+                        RecycleRadio();
+                        os::SleepThread(TimeSpan::FromSeconds(3));
+                        continue;
+                    }
+                    paired = true;
                 }
 
                 // Hands the HID service to the stack's HID host layer for this link: its notifications, and the results
@@ -811,9 +824,16 @@ namespace ams::ble {
 
                 // The subscription is judged by the CCCD write's result; the pad only reports on input
                 events::ClearGattFailure();
-                g_controller_kind = ControllerKind_Xbox;
                 gatt::HidService hid;
-                rc = gatt::Subscribe(conn_id, &hid);
+                rc = gatt::Subscribe(conn_id, &hid, paired ? BtdrvGattAuthReqType_NoMitm : BtdrvGattAuthReqType_None);
+                if (R_FAILED(rc) && !paired && !events::IsDisconnected()) {
+                    log::Write("unencrypted subscription failed rc=0x%x gatt_result=%u, pairing", rc.GetValue(), events::GetGattFailure());
+                    paired = Pair(address);
+                    if (paired) {
+                        events::ClearGattFailure();
+                        rc = gatt::Subscribe(conn_id, &hid);
+                    }
+                }
                 if (R_FAILED(rc)) {
                     log::Write("subscription failed rc=0x%x gatt_result=%u", rc.GetValue(), events::GetGattFailure());
                     Disconnect();

@@ -122,13 +122,23 @@ namespace ams::ble::gatt {
         log::Write("attribute table holds %u entries%s", g_table.count, reuse ? " (kept from previous connection)" : "");
     }
 
+    bool HasService128(const u8 (&uuid)[0x10]) {
+        for (size_t i = 0; i < g_table.count; ++i) {
+            auto &attr = g_table.attributes[i];
+            if ((attr.type == BtdrvGattAttributeType_Service) && (attr.id.uuid.size == 0x10) && (std::memcmp(attr.id.uuid.uuid, uuid, sizeof(uuid)) == 0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool TakeRediscovered() {
         const bool rediscovered = g_rediscovered;
         g_rediscovered = false;
         return rediscovered;
     }
 
-    Result Subscribe(u32 conn_id, HidService *out) {
+    Result Subscribe(u32 conn_id, HidService *out, BtdrvGattAuthReqType auth) {
         auto found = FindService(GattServiceHid);
         if (!found) {
             log::Write("no HID service in attribute table");
@@ -157,7 +167,7 @@ namespace ams::ble::gatt {
                 const u32 results = events::GetGattResultCount();
                 Result rc;
                 for (int attempt = 0; ; ++attempt) {
-                    rc = btdrvReadGattCharacteristic(conn_id, service.is_primary, &service.id, &attr.id, BtdrvGattAuthReqType_NoMitm);
+                    rc = btdrvReadGattCharacteristic(conn_id, service.is_primary, &service.id, &attr.id, auth);
                     log::Write("btdrvReadGattCharacteristic handle=0x%04x rc=0x%x", attr.handle, rc.GetValue());
                     // Refused locally while the pad's connection parameter update is in flight; it clears within a second or two
                     if (!ResultInsufficientAuthentication::Includes(rc) || (attempt >= 4) || events::IsDisconnected()) {
@@ -203,7 +213,7 @@ namespace ams::ble::gatt {
             // The write's asynchronous result is the subscription's: an error means the link never encrypted
             const u32 results = events::GetGattResultCount();
             const u8 enable_notifications[2] = { 0x01, 0x00 };
-            rc = btdrvWriteGattDescriptor(conn_id, service.is_primary, &service.id, &attr.id, &cccd->id, enable_notifications, sizeof(enable_notifications), BtdrvGattAuthReqType_NoMitm);
+            rc = btdrvWriteGattDescriptor(conn_id, service.is_primary, &service.id, &attr.id, &cccd->id, enable_notifications, sizeof(enable_notifications), auth);
             log::Write("btdrvWriteGattDescriptor(CCCD) handle=0x%04x rc=0x%x", cccd->handle, rc.GetValue());
             R_TRY(rc);
             R_UNLESS(events::WaitForGattResult(results, TimeSpan::FromSeconds(2)), svc::ResultTimedOut());

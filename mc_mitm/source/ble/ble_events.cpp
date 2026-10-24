@@ -182,6 +182,21 @@ namespace ams::ble::events {
             return (have_target && AddressEqual(address, target)) || (have_claimed && AddressEqual(address, claimed));
         };
 
+        // EXPERIMENT. Which pairing traffic a controller that is connected but not bonded raises
+        if ((have_target || have_claimed) && (type != BtdrvEventType_InquiryDevice) && (type != BtdrvEventType_InquiryStatus) && (type != BtdrvEventType_Connection)) {
+            const u8 *raw = reinterpret_cast<const u8 *>(info);
+            log::Write("core evt type=%u %02x:%02x:%02x:%02x:%02x:%02x %02x %02x %02x %02x %02x %02x %02x %02x", type,
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13]);
+        }
+
+        if (type == BtdrvEventType_PairingPinCodeRequest) {
+            auto &request = info->pairing_pin_code_request;
+            if (is_ours(request.addr)) {
+                log::Write("pin code request for the controller");
+            }
+            return false;
+        }
+
         // btm knows nothing about the controller, so its pairing traffic is answered here (Just Works)
         if (type == BtdrvEventType_SspRequest) {
             auto &request = info->ssp_request.v12;
@@ -201,7 +216,8 @@ namespace ams::ble::events {
                 return false;
             }
 
-            log::Write("core evt Connection type=%u for the controller", connection.type);
+            log::Write("core evt Connection type=%u for the controller (%02x %02x %02x %02x %02x %02x %02x %02x)", connection.type,
+                connection.reserved[0], connection.reserved[1], connection.reserved[2], connection.reserved[3], connection.reserved[4], connection.reserved[5], connection.reserved[6], connection.reserved[7]);
             LogAddress("  address", connection.addr);
             if (connection.type == CoreConnectionType_Suspended) {
                 std::scoped_lock lk(g_lock);
