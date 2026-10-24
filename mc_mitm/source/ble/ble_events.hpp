@@ -55,6 +55,13 @@ namespace ams::ble::events {
     u32 GetGattFailure();       // last non-zero result since ClearGattFailure
     void ClearGattFailure();
 
+    // Input Report notifications for the connected pad when its HID service is not handed to the stack's HID
+    // host layer (they then arrive on the managed BLE event stream); called from the btdrv event thread
+    using InputSink = void (*)(const u8 *data, size_t size);
+    void SetInputSink(InputSink sink);
+    // GATT results on the managed stream are counted as the LE HID ones are, see NoteGattResult
+    void SetCountManagedGattResults(bool count);
+
     // A link that came up for an address the host tried to reach while no target is set (a cancelled request
     // completing anyway) is held for the host to take over
     bool TakeAdoptedConnection(bluetooth::Address *out_address, u32 *out_conn_id);

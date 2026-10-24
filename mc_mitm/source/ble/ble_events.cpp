@@ -69,6 +69,8 @@ namespace ams::ble::events {
         constinit bool g_bond_complete = false;
 
         constinit Sink g_sink = nullptr;
+        constinit InputSink g_input_sink = nullptr;
+        constinit bool g_count_managed_results = false;
 
         void LogGattAttribute(const BtdrvGattAttribute &attr) {
             char uuid[0x40];
@@ -95,6 +97,28 @@ namespace ams::ble::events {
     }
 
     bool OnBleEvent(bluetooth::BleEventType type, const bluetooth::BleEventInfo *info) {
+        if (type == BtdrvBleEventType_ClientNotify) {
+            auto &notify = info->client_notify;
+            InputSink sink;
+            bool count_results;
+            u32 conn_id;
+            {
+                std::scoped_lock lk(g_lock);
+                sink = g_active ? g_input_sink : nullptr;
+                count_results = g_active && g_count_managed_results;
+                conn_id = g_conn_id;
+            }
+            if (notify.conn_id == conn_id) {
+                if (sink && (notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    sink(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
+                    return true;
+                }
+                if (count_results && (notify.type != GattNotifyType_Notification)) {
+                    NoteGattResult(notify.result);
+                }
+            }
+        }
+
         std::scoped_lock lk(g_lock);
 
         if (!g_active) {
@@ -450,6 +474,16 @@ namespace ams::ble::events {
 
     void WaitForQueue(TimeSpan timeout) {
         g_ring_event.TimedWait(timeout);
+    }
+
+    void SetInputSink(InputSink sink) {
+        std::scoped_lock lk(g_lock);
+        g_input_sink = sink;
+    }
+
+    void SetCountManagedGattResults(bool count) {
+        std::scoped_lock lk(g_lock);
+        g_count_managed_results = count;
     }
 
     void SetSink(Sink sink) {

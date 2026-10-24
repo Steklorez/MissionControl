@@ -172,6 +172,29 @@ namespace ams::ble {
             return (std::strncmp(summary.name, "Xbox", 4) == 0) || (std::strncmp(summary.name, "8BitDo", 6) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad));
         }
 
+        // An input Report notification from the connected pad, from whichever stream it arrives on
+        void DeliverInputReport(const u8 *data, size_t size) {
+            std::shared_ptr<controller::BleHidController> controller;
+            bool parked;
+            {
+                std::scoped_lock lk(g_controller_lock);
+                controller = g_controller;
+                parked = g_parked;
+            }
+            if (!controller) {
+                return;
+            }
+            if (parked) {
+                // What brings a controller back on the Controllers screen is L+R; afterwards any button does
+                if (controller->ReportHasShoulderButtons(data, size) || (!events::IsPairingWindowOpen() && controller->ReportHasAnyInput(data, size))) {
+                    Unpark();
+                } else {
+                    return;
+                }
+            }
+            static_cast<void>(controller->HandleInputReport(data, size));
+        }
+
         /* LE HID event stream: notifications from services registered with RegisterGattHidDataPath, and the results
            of our GATT requests on them, arrive here rather than on the managed BLE event */
 
@@ -202,25 +225,7 @@ namespace ams::ble {
                 }
 
                 if ((notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
-                    const size_t size = std::min<size_t>(notify.size, sizeof(notify.data));
-                    std::shared_ptr<controller::BleHidController> controller;
-                    bool parked;
-                    {
-                        std::scoped_lock lk(g_controller_lock);
-                        controller = g_controller;
-                        parked = g_parked;
-                    }
-                    if (parked) {
-                        // What brings a controller back on the Controllers screen is L+R; afterwards any button does
-                        if (controller && (controller->ReportHasShoulderButtons(notify.data, size) || (!events::IsPairingWindowOpen() && controller->ReportHasAnyInput(notify.data, size)))) {
-                            Unpark();
-                        } else {
-                            continue;
-                        }
-                    }
-                    if (controller) {
-                        static_cast<void>(controller->HandleInputReport(notify.data, size));
-                    }
+                    DeliverInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
                 } else {
                     if ((notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReportMap)) {
                         NoteReportMap(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
@@ -710,6 +715,8 @@ namespace ams::ble {
             events::SetConnection(InvalidConnId);
             events::SetTarget(nullptr);
             events::SetClaimedAddress(nullptr);
+            events::SetInputSink(nullptr);
+            events::SetCountManagedGattResults(false);
         }
 
         void RunConnected(u32 conn_id) {
@@ -817,10 +824,18 @@ namespace ams::ble {
                 }
 
                 // Hands the HID service to the stack's HID host layer for this link: its notifications, and the results
-                // of our requests on it, then arrive on the LE HID event stream
-                auto hid_uuid = MakeUuid16(GattServiceHid);
-                Result rc = btdrvRegisterGattHidDataPath(&hid_uuid);
-                log::Write("btdrvRegisterGattHidDataPath rc=0x%x", rc.GetValue());
+                // of our requests on it, then arrive on the LE HID event stream. That layer secures the link itself,
+                // and an 8BitDo pad never completes the pairing it starts: the stack drops the link when it times
+                // out 30 s later. Its service is used directly instead, over the managed BLE event stream.
+                const bool managed = (g_controller_kind == ControllerKind_EightBitDo);
+                events::SetCountManagedGattResults(managed);
+                events::SetInputSink(managed ? DeliverInputReport : nullptr);
+                Result rc = ResultSuccess();
+                if (!managed) {
+                    auto hid_uuid = MakeUuid16(GattServiceHid);
+                    rc = btdrvRegisterGattHidDataPath(&hid_uuid);
+                    log::Write("btdrvRegisterGattHidDataPath rc=0x%x", rc.GetValue());
+                }
 
                 // The subscription is judged by the CCCD write's result; the pad only reports on input
                 events::ClearGattFailure();
