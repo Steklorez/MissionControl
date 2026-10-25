@@ -458,6 +458,11 @@ namespace ams::ble {
         // Set when PrepareForSleep dropped the link: that end of link is no reason to cycle the radio on wake
         constinit bool g_dropped_for_sleep = false;
 
+        // Set when a bonded (Xbox) link ended while other controllers were connected: the cycle that lets that
+        // pad pair again would drop them too (a DualShock/DualSense switches itself off when its link goes), so it
+        // waits until the pad is back and about to pair
+        constinit bool g_cycle_pending = false;
+
         // EXPERIMENT. The stack refuses every CreateBond for a controller that has been switched off until the
         // console restarts. A restart is not the only thing that resets the stack: btm cycles the radio whenever
         // btdrv reports a BluetoothCrash, which is how BLE came up in PrepareClient. Ask btdrv for one and pick up
@@ -916,6 +921,14 @@ namespace ams::ble {
                 // that needs encryption; see whether it serves its HID service without, before pairing at all
                 bool paired = false;
                 if (g_controller_kind != ControllerKind_EightBitDo) {
+                    if (g_cycle_pending) {
+                        g_cycle_pending = false;
+                        log::Write("radio cycle deferred from the last link, doing it before pairing");
+                        Disconnect();
+                        RecycleRadio();
+                        os::SleepThread(TimeSpan::FromSeconds(3));
+                        continue;
+                    }
                     if (!Pair(address)) {
                         g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                         log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
@@ -972,9 +985,19 @@ namespace ams::ble {
 
                 // Nothing beyond the teardown is asked of the stack once the link is gone: removing the bond and
                 // detaching the HID host layer here were both tried and changed nothing. A radio cycle is the one
-                // thing left to try (skipped when the link ended because the console is going to sleep).
+                // thing that lets a bonded pad pair again (skipped when the link ended because the console is going
+                // to sleep). An 8BitDo pad never bonds and needs none.
                 Disconnect();
-                RecycleRadio();
+                if (paired) {
+                    if (controller::GetControllerCount() > 0 && !g_dropped_for_sleep) {
+                        g_cycle_pending = true;
+                        log::Write("radio cycle put off: %u other controller(s) connected", static_cast<u32>(controller::GetControllerCount()));
+                    } else {
+                        RecycleRadio();
+                    }
+                } else {
+                    g_dropped_for_sleep = false;
+                }
             }
         }
 
