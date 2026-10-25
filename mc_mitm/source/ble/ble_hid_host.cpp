@@ -492,6 +492,7 @@ namespace ams::ble {
 
             events::Pump(TimeSpan::FromSeconds(6));
             g_pairing_failed_tick = 0;
+            g_cycle_pending = false;
 
             if (u8 spare = events::GetSpareClientIf(); spare != InvalidClientIf) {
                 g_client_if = spare;
