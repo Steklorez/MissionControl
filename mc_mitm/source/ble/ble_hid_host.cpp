@@ -448,6 +448,9 @@ namespace ams::ble {
         constexpr TimeSpan BackgroundScanDuration = TimeSpan::FromMilliSeconds(2500);
         constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(2000);
 
+        // Covers one classic inquiry (10.24 s), during which the stack refuses connections
+        constexpr TimeSpan ConnectRefusedRetryTime = TimeSpan::FromSeconds(12);
+
         bool BackgroundScanWanted() {
             return AutoConnectEnabled() && g_have_remembered && events::IsRadioEnabled() && !events::IsPairingWindowOpen();
         }
@@ -647,13 +650,37 @@ namespace ams::ble {
             Result rc = btdrvRemoveBond(address);
             log::Write("btdrvRemoveBond rc=0x%x", rc.GetValue());
 
-            rc = btdrvConnectGattServer(g_client_if, address, true, 0);
-            log::Write("btdrvConnectGattServer rc=0x%x", rc.GetValue());
-            R_TRY(rc);
+            // While btm runs a classic inquiry (10.24 s, e.g. at boot or when the Controllers screen opens) the
+            // stack turns a connection down at once (result 26). The pad keeps advertising for its reconnect, so
+            // keep asking until the inquiry is over instead of letting the pad give up.
+            const auto deadline = os::GetSystemTick().ToTimeSpan() + ConnectRefusedRetryTime;
+            int refused = 0;
+            for (;;) {
+                rc = btdrvConnectGattServer(g_client_if, address, true, 0);
+                if (refused == 0) {
+                    log::Write("btdrvConnectGattServer rc=0x%x", rc.GetValue());
+                }
+                R_TRY(rc);
 
-            rc = WaitForConnection(address, out_conn_id, timeout);
-            if (R_FAILED(rc)) {
+                const auto asked = os::GetSystemTick().ToTimeSpan();
+                rc = WaitForConnection(address, out_conn_id, timeout);
+                if (R_SUCCEEDED(rc)) {
+                    break;
+                }
                 static_cast<void>(btdrvCancelConnectGattServer(g_client_if, address, true));
+
+                const auto now = os::GetSystemTick().ToTimeSpan();
+                const bool refused_at_once = ResultNoConnection::Includes(rc) && (now - asked) < TimeSpan::FromSeconds(1);
+                if (!refused_at_once || now >= deadline || !events::IsRadioEnabled()) {
+                    break;
+                }
+                if (++refused == 1) {
+                    log::Write("connection refused, retrying while the radio is busy");
+                }
+                events::Pump(TimeSpan::FromMilliSeconds(500));
+            }
+            if (refused > 0) {
+                log::Write("%s after %d refused connection attempts", R_SUCCEEDED(rc) ? "connected" : "gave up", refused);
             }
             R_RETURN(rc);
         }
