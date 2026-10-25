@@ -74,6 +74,12 @@ namespace ams::ble::events {
     void SetInquiryActive(bool active);
     bool IsPairingWindowOpen();
 
+    // Classic Bluetooth activity: btm stopping its inquiry (it found a controller and is about to connect to
+    // it), and connection or pairing events for classic devices. A BLE scan running at the same time as a
+    // classic connection being set up crashes the stack, so scans keep clear of it for a while.
+    void NoteClassicActivity();
+    bool ClassicActivityWithin(TimeSpan span);
+
     // Set when the stack reports the bond with the target complete (core Connection event)
     bool TakeBondComplete();
 

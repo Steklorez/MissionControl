@@ -440,6 +440,11 @@ namespace ams::ble {
         // bring it back. What works outside the Controllers screen is the sync button: the controller then
         // advertises to anyone, and a scan finds it at once since btm's inquiry only runs while the screen is
         // open. Scanning in bursts while no controller is connected keeps the radio mostly free.
+        // No BLE scan runs within this long of classic activity (a controller being connected or paired): the
+        // stack crashed, and btm cycled the radio, every time a scan was running while a classic controller
+        // connected (seven times in a row in one session, 10-13 s after each scan started)
+        constexpr TimeSpan ClassicActivityHoldOff = TimeSpan::FromSeconds(12);
+
         constexpr TimeSpan BackgroundScanDuration = TimeSpan::FromMilliSeconds(2500);
         constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(2000);
 
@@ -534,6 +539,11 @@ namespace ams::ble {
             int attempts = 0;
             const bool in_window = events::IsPairingWindowOpen();
             for (;;) {
+                if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                    log::Write("scan not started: a classic controller is connecting");
+                    events::Pump(TimeSpan::FromSeconds(1));
+                    R_THROW(svc::ResultCancelled());
+                }
                 rc = btdrvStartBleScan();
                 if (R_SUCCEEDED(rc) || (++attempts >= (in_window ? 150 : 3)) || (in_window && !events::IsPairingWindowOpen())) {
                     break;
@@ -554,20 +564,35 @@ namespace ams::ble {
 
             EventRecord e;
             // Ends early if a link came up by itself or the console is going to sleep
-            const bool found = events::WaitFor(events::InvalidType, duration, &e, [only_remembered](const EventRecord &r) {
-                if (r.type != BtdrvBleEventType_ScanResult) {
-                    return events::HasAdoptedConnection() || !events::IsRadioEnabled();
+            // Waited for in short slices so that the scan can be stopped as soon as a classic controller starts
+            // connecting (see NoteClassicActivity), not only when an event happens to arrive
+            const auto deadline = os::GetSystemTick().ToTimeSpan() + duration;
+            bool found = false;
+            bool aborted = false;
+            for (;;) {
+                const auto now = os::GetSystemTick().ToTimeSpan();
+                if (now >= deadline) {
+                    break;
                 }
-                if (r.info.scan_result.status != BleScanStatus_NewDevice) {
-                    return false;
+                found = events::WaitFor(BtdrvBleEventType_ScanResult, std::min(deadline - now, TimeSpan::FromMilliSeconds(250)), &e, [only_remembered](const EventRecord &r) {
+                    if (r.info.scan_result.status != BleScanStatus_NewDevice) {
+                        return false;
+                    }
+                    if (only_remembered) {
+                        return IsRememberedDevice(r.info.scan_result.address);
+                    }
+                    AdvertisementSummary summary;
+                    ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
+                    return IsSupportedController(summary);
+                });
+                if (found) {
+                    break;
                 }
-                if (only_remembered) {
-                    return IsRememberedDevice(r.info.scan_result.address);
+                if (events::HasAdoptedConnection() || !events::IsRadioEnabled() || events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                    aborted = true;
+                    break;
                 }
-                AdvertisementSummary summary;
-                ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
-                return IsSupportedController(summary);
-            });
+            }
 
             static_cast<void>(btdrvStopBleScan());
             events::ExpectFilterEvent();
@@ -576,7 +601,10 @@ namespace ams::ble {
             // The scan-complete and filter events trail the calls above
             events::Pump(TimeSpan::FromSeconds(1));
 
-            R_UNLESS(!events::HasAdoptedConnection() && events::IsRadioEnabled(), svc::ResultCancelled());
+            if (aborted && !events::HasAdoptedConnection() && events::IsRadioEnabled()) {
+                log::Write("scan stopped: a classic controller is connecting");
+            }
+            R_UNLESS(!aborted, svc::ResultCancelled());
             R_UNLESS(found, svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
@@ -817,8 +845,9 @@ namespace ams::ble {
 
                 // Any gamepad in pairing mode while the Controllers screen is open; only the remembered one,
                 // in short bursts, the rest of the time
-                const bool in_window = events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive();
-                const bool background = !in_window && !PairingBackoffActive() && BackgroundScanWanted();
+                const bool classic_busy = events::ClassicActivityWithin(ClassicActivityHoldOff);
+                const bool in_window = !classic_busy && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive();
+                const bool background = !classic_busy && !in_window && !PairingBackoffActive() && BackgroundScanWanted();
                 if (!connected && (in_window || background)) {
                     Result rc = in_window ? Scan(&address, TimeSpan::FromSeconds(10)) : Scan(&address, BackgroundScanDuration, true);
                     if (Adopt(&address, &conn_id)) {

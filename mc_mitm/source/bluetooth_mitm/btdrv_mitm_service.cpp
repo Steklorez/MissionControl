@@ -200,6 +200,8 @@ namespace ams::mitm::bluetooth {
 
     Result BtdrvMitmService::StopInquiry() {
         ams::ble::events::SetInquiryActive(false);
+        // btm ends an inquiry early to connect to a controller it found: no BLE scan may run while it does
+        ams::ble::events::NoteClassicActivity();
         ams::ble::log::Write("btm stopped its inquiry");
         ams::ble::OnPairingWindow(false);
         R_RETURN(btdrvStopInquiryFwd(m_forward_service.get()));

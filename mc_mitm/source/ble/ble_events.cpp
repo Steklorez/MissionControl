@@ -66,6 +66,7 @@ namespace ams::ble::events {
         constinit bool g_radio_cycled = false;
 
         constinit s64 g_inquiry_started_tick = 0;
+        constinit s64 g_classic_activity_tick = 0;
         constinit bool g_bond_complete = false;
 
         constinit Sink g_sink = nullptr;
@@ -229,6 +230,12 @@ namespace ams::ble::events {
                 log::Write("btdrvRespondToSspRequest(accept) rc=0x%x", rc.GetValue());
                 return true;
             }
+            NoteClassicActivity();
+            return false;
+        }
+
+        if (type == BtdrvEventType_PairingPinCodeRequest) {
+            NoteClassicActivity();
             return false;
         }
 
@@ -237,6 +244,7 @@ namespace ams::ble::events {
             if (!is_ours(connection.addr)) {
                 // btm's own events run through here under the core event lock; writing the log there would put
                 // an SD card access in front of every classic Bluetooth connection
+                NoteClassicActivity();
                 return false;
             }
 
@@ -405,6 +413,23 @@ namespace ams::ble::events {
     bool IsPairingWindowOpen() {
         std::scoped_lock lk(g_lock);
         return g_inquiry_started_tick != 0;
+    }
+
+    void NoteClassicActivity() {
+        {
+            std::scoped_lock lk(g_lock);
+            g_classic_activity_tick = os::GetSystemTick().GetInt64Value();
+        }
+        // Wake a scan that is waiting on the queue so it can stop
+        g_ring_event.Signal();
+    }
+
+    bool ClassicActivityWithin(TimeSpan span) {
+        std::scoped_lock lk(g_lock);
+        if (g_classic_activity_tick == 0) {
+            return false;
+        }
+        return (os::GetSystemTick() - os::Tick(g_classic_activity_tick)).ToTimeSpan() < span;
     }
 
     bool TakeBondComplete() {
