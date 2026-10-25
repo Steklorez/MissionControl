@@ -32,7 +32,11 @@ namespace ams::ble::log {
         void AppendToFile(const char *data, size_t size) {
             fs::FileHandle file;
             if (R_FAILED(fs::OpenFile(std::addressof(file), LogFilePath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
-                return;
+                // Taken off the SD card (over MTP) while running: start a new one rather than stop logging
+                if (R_FAILED(fs::CreateFile(LogFilePath, 0)) ||
+                    R_FAILED(fs::OpenFile(std::addressof(file), LogFilePath, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
+                    return;
+                }
             }
             ON_SCOPE_EXIT { fs::CloseFile(file); };
 
