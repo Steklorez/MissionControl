@@ -48,25 +48,39 @@ namespace ams::ble {
 
         constinit u8 g_client_if = InvalidClientIf;
 
+        // EXPERIMENT. A second link at once was refused (0x29e71) on the client_if already holding a link; another
+        // client is tried for it: one registered for us if the stack has room, else one of btm's (it never connects
+        // with them on a retail console). Gone with every radio cycle.
+        constinit u8 g_extra_client_if = InvalidClientIf;
+        // The client the link being set up was connected with
+        constinit u8 g_setup_client_if = InvalidClientIf;
+
         // A refused pairing leaves the stack refusing the next ones for a while, so asking again straight away
         // only keeps that going
         constexpr TimeSpan PairingRetryBackoff = TimeSpan::FromSeconds(30);
         constinit s64 g_pairing_failed_tick = 0;
 
-        /* The controller currently presented to the system */
-        constinit os::SdkMutex g_controller_lock;
-        std::shared_ptr<controller::BleHidController> g_controller;
-        std::shared_ptr<controller::SwitchController> g_switch_controller;
-
-        // Which driver the connected pad gets, told apart by its services once discovered
+        // Which driver a pad gets, told apart by its services once discovered
         enum ControllerKind {
             ControllerKind_Xbox,
             ControllerKind_EightBitDo,
         };
+
+        // Kind of the pad being set up
         constinit ControllerKind g_controller_kind = ControllerKind_Xbox;
 
-        // Set while the HID service is registered as a managed data path (8BitDo pads)
+        // Set while the HID service is registered as a managed data path (8BitDo pads). The registration is by
+        // service UUID, not per link, so it stays while any 8BitDo link needs it.
         constinit bool g_managed_path = false;
+
+        // EXPERIMENT. Both data paths are registered by service UUID, so an Xbox pad on the HID data path and an
+        // 8BitDo pad on the managed one exclude each other (the second registration fails with 0x2ac71). The
+        // managed path was chosen for 8BitDo pads before the SMP timer patch, when the HID host layer dropped them
+        // 30 s into a pairing they never finish; the HID data path is tried for them again. An 8BitDo link that
+        // fails to subscribe there, or drops within LinkProbation of being presented, sends them back to the
+        // managed path for the rest of the session.
+        constinit bool g_eightbitdo_managed = false;
+        constexpr TimeSpan LinkProbation = TimeSpan::FromSeconds(45);
 
         // 00010203-0405-0607-0809-0a0b0c0d1912, as the stack reports it
         constexpr u8 EightBitDoVendorService[0x10] = { 0x12, 0x19, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00 };
@@ -76,61 +90,201 @@ namespace ams::ble {
             log::Write("report map size=%u%s", static_cast<u32>(size), eightbitdo ? ", 8BitDo layout" : "");
         }
 
-        // Withdrawn from hid while the Controllers screen is open, as the screen does with every controller;
-        // the link stays up and the controller comes back on LB+RB (any button once the screen is closed)
-        constinit bool g_parked = false;
-        constinit s64 g_present_tick = 0;
-
         // hid registers a controller on the first input report it sees after re-reading btm's device list, which
         // it does some time after being signalled; a report sent straight after the signal is dropped and the
         // controller only appeared once a button was pressed. The pad's resting state is therefore delivered a
         // few times over the next seconds (ticks at which a copy is due, zero once sent).
         constexpr size_t NeutralReportCount = 4;
         constexpr s64 NeutralReportDelaysMs[NeutralReportCount] = { 0, 300, 1000, 2500 };
-        constinit s64 g_neutral_due[NeutralReportCount] = {};
 
-        void ScheduleNeutralReports() {
-            const s64 now = os::GetSystemTick().GetInt64Value();
+        /* Controllers presented to the system, one per established link. Links are set up one at a time by the
+           host thread; once presented, a link runs on its own (its input arrives on the btdrv event threads) while
+           the host thread looks for the next controller. */
+        constexpr size_t MaxLinks = 2;
+
+        struct Link {
+            bool used = false;
+            u32 conn_id = InvalidConnId;
+            u8 client_if = InvalidClientIf;
+            bluetooth::Address address = {};
+            ControllerKind kind = ControllerKind_Xbox;
+            bool paired = false;    // bonded (Xbox): it pairs again only after a radio cycle
+            bool managed = false;   // HID service on the managed data path (8BitDo)
+            std::shared_ptr<controller::BleHidController> controller;
+            std::shared_ptr<controller::SwitchController> switch_controller;
+            s64 neutral_due[NeutralReportCount] = {};
+            s64 present_tick = 0;
+        };
+
+        constinit os::SdkMutex g_controller_lock;
+        Link g_links[MaxLinks];
+
+        size_t LinkCount() {
             std::scoped_lock lk(g_controller_lock);
+            size_t count = 0;
+            for (auto &link : g_links) {
+                count += link.used ? 1 : 0;
+            }
+            return count;
+        }
+
+        bool IsLinked(const bluetooth::Address &address) {
+            std::scoped_lock lk(g_controller_lock);
+            for (auto &link : g_links) {
+                if (link.used && AddressEqual(link.address, address)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool ClientIfInUse(u8 client_if) {
+            std::scoped_lock lk(g_controller_lock);
+            for (auto &link : g_links) {
+                if (link.used && (link.client_if == client_if)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        size_t GetEightBitDoLinks(bluetooth::Address *out_addresses, u32 *out_conn_ids) {
+            std::scoped_lock lk(g_controller_lock);
+            size_t count = 0;
+            for (auto &link : g_links) {
+                if (link.used && (link.kind == ControllerKind_EightBitDo)) {
+                    out_addresses[count] = link.address;
+                    out_conn_ids[count] = link.conn_id;
+                    ++count;
+                }
+            }
+            return count;
+        }
+
+        // While set, 8BitDo pads are not connected: the stack was restarted under one so that an Xbox pad could
+        // pair first (see the host loop)
+        constinit s64 g_eightbitdo_held_until = 0;
+        constexpr TimeSpan EightBitDoHoldForPairing = TimeSpan::FromSeconds(25);
+
+        void HoldEightBitDo() {
+            g_eightbitdo_held_until = (os::GetSystemTick() + os::ConvertToTick(EightBitDoHoldForPairing)).GetInt64Value();
+        }
+
+        bool EightBitDoHeld() {
+            return (g_eightbitdo_held_until != 0) && (os::GetSystemTick().GetInt64Value() < g_eightbitdo_held_until);
+        }
+
+        bool AnyManagedLink() {
+            std::scoped_lock lk(g_controller_lock);
+            for (auto &link : g_links) {
+                if (link.used && link.managed) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void ScheduleNeutralReports(Link &link) {
+            const s64 now = os::GetSystemTick().GetInt64Value();
             for (size_t i = 0; i < NeutralReportCount; ++i) {
-                g_neutral_due[i] = now + os::ConvertToTick(TimeSpan::FromMilliSeconds(NeutralReportDelaysMs[i])).GetInt64Value();
+                link.neutral_due[i] = now + os::ConvertToTick(TimeSpan::FromMilliSeconds(NeutralReportDelaysMs[i])).GetInt64Value();
             }
         }
 
         void ServiceNeutralReports() {
-            std::shared_ptr<controller::BleHidController> controller;
-            bool due = false;
+            std::shared_ptr<controller::BleHidController> due_controllers[MaxLinks];
+            size_t count = 0;
             {
                 std::scoped_lock lk(g_controller_lock);
                 const s64 now = os::GetSystemTick().GetInt64Value();
-                for (size_t i = 0; i < NeutralReportCount; ++i) {
-                    if ((g_neutral_due[i] != 0) && (now >= g_neutral_due[i])) {
-                        g_neutral_due[i] = 0;
-                        due = true;
+                for (auto &link : g_links) {
+                    if (!link.used) {
+                        continue;
+                    }
+                    bool due = false;
+                    for (auto &tick : link.neutral_due) {
+                        if ((tick != 0) && (now >= tick)) {
+                            tick = 0;
+                            due = true;
+                        }
+                    }
+                    if (due) {
+                        due_controllers[count++] = link.controller;
                     }
                 }
-                if (due && !g_parked) {
-                    controller = g_controller;
-                }
             }
-            if (controller) {
-                static_cast<void>(controller->HandleNeutralReport());
+            for (size_t i = 0; i < count; ++i) {
+                static_cast<void>(due_controllers[i]->HandleNeutralReport());
             }
         }
 
-        void Unpark() {
-            std::shared_ptr<controller::SwitchController> controller;
+        // The registration outlives a link only while another 8BitDo link still uses it
+        void ReleaseManagedPath() {
+            if (g_managed_path && !AnyManagedLink()) {
+                auto hid_uuid = MakeUuid16(GattServiceHid);
+                static_cast<void>(btdrvUnregisterGattManagedDataPath(&hid_uuid));
+                g_managed_path = false;
+            }
+        }
+
+        // Withdraws a link's controller from the system. The link is closed first unless it is already down.
+        // Returns whether the pad was bonded (an Xbox controller), whose end calls for a radio cycle.
+        bool TeardownLink(u32 conn_id, bool link_down, bool by_cycle = false) {
+            Link removed;
             {
                 std::scoped_lock lk(g_controller_lock);
-                if (!g_parked || !g_switch_controller) {
-                    return;
+                for (auto &link : g_links) {
+                    if (link.used && (link.conn_id == conn_id)) {
+                        removed = std::move(link);
+                        link = Link{};
+                        break;
+                    }
                 }
-                g_parked = false;
-                controller = g_switch_controller;
             }
-            controller::ReattachVirtualController(controller);
-            ScheduleNeutralReports();
-            log::Write("controller presented to the system again");
+            if (!removed.used) {
+                return false;
+            }
+
+            events::RemoveLink(conn_id);
+            // Nothing may touch the radio while the system has BLE switched off: it wakes the console
+            if (!link_down && events::IsRadioEnabled()) {
+                static_cast<void>(btdrvDisconnectGattServer(conn_id));
+            }
+            if (removed.controller) {
+                removed.controller->StopRumble();
+            }
+            if (removed.switch_controller) {
+                controller::DetachVirtualController(removed.address);
+            }
+            events::RemoveClaimedAddress(removed.address);
+            ReleaseManagedPath();
+            events::LogAddress("controller removed from the system", removed.address);
+
+            if (link_down && !by_cycle && (removed.kind == ControllerKind_EightBitDo) && !removed.managed && !g_eightbitdo_managed &&
+                ((os::GetSystemTick() - os::Tick(removed.present_tick)).ToTimeSpan() < LinkProbation)) {
+                g_eightbitdo_managed = true;
+                log::Write("8BitDo link on the HID data path ended early, back to the managed data path");
+            }
+            return removed.paired;
+        }
+
+        // A radio cycle takes every link down with it. The pads are not told: one the host disconnects takes it as
+        // being let go and switches itself off (an 8BitDo pad, like a DualShock), one that loses the link looks
+        // for the console again.
+        void DropAllLinks() {
+            u32 conn_ids[MaxLinks];
+            size_t count = 0;
+            {
+                std::scoped_lock lk(g_controller_lock);
+                for (auto &link : g_links) {
+                    if (link.used) {
+                        conn_ids[count++] = link.conn_id;
+                    }
+                }
+            }
+            for (size_t i = 0; i < count; ++i) {
+                static_cast<void>(TeardownLink(conn_ids[i], true, true));
+            }
         }
 
         /* Advertisement parsing */
@@ -175,33 +329,30 @@ namespace ams::ble {
             return (std::strncmp(summary.name, "Xbox", 4) == 0) || (std::strncmp(summary.name, "8BitDo", 6) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad));
         }
 
-        // An input Report notification from the connected pad, from whichever stream it arrives on
-        void DeliverInputReport(const u8 *data, size_t size) {
+        // An input Report notification from a connected pad, from whichever stream it arrives on
+        void DeliverInputReport(u32 conn_id, const u8 *data, size_t size) {
             std::shared_ptr<controller::BleHidController> controller;
-            bool parked;
+            bool eightbitdo = false;
             {
                 std::scoped_lock lk(g_controller_lock);
-                controller = g_controller;
-                parked = g_parked;
+                for (auto &link : g_links) {
+                    if (link.used && (link.conn_id == conn_id)) {
+                        controller = link.controller;
+                        eightbitdo = link.kind == ControllerKind_EightBitDo;
+                        break;
+                    }
+                }
             }
             if (!controller) {
                 return;
             }
-            // Debug: the report's non-analog bytes whenever they change (hat, buttons, vendor bytes, tail)
+            // Debug: an 8BitDo report's non-analog bytes whenever they change (hat, buttons, vendor bytes, tail)
             static u8 last_bytes[8];
-            if (size >= 33) {
+            if (eightbitdo && (size >= 33)) {
                 const u8 bytes[8] = { data[0], data[7], data[8], data[9], data[10], data[11], data[12], data[32] };
                 if (std::memcmp(last_bytes, bytes, sizeof(bytes)) != 0) {
                     std::memcpy(last_bytes, bytes, sizeof(bytes));
                     log::Write("buttons hat=%02x %02x %02x %02x | %02x %02x %02x | tail %02x", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
-                }
-            }
-            if (parked) {
-                // What brings a controller back on the Controllers screen is L+R; afterwards any button does
-                if (controller->ReportHasShoulderButtons(data, size) || (!events::IsPairingWindowOpen() && controller->ReportHasAnyInput(data, size))) {
-                    Unpark();
-                } else {
-                    return;
                 }
             }
             static_cast<void>(controller->HandleInputReport(data, size));
@@ -231,13 +382,17 @@ namespace ams::ble {
                 }
 
                 auto &notify = g_le_hid_record.info.client_notify;
-                if ((g_le_hid_record.type != BtdrvBleEventType_ClientNotify) || (notify.conn_id != events::GetConnection())) {
+                if (g_le_hid_record.type != BtdrvBleEventType_ClientNotify) {
                     events::Log(g_le_hid_record);
                     continue;
                 }
 
+                // Input from any connected pad goes to its own controller; only the link being set up waits on
+                // the results of requests
                 if ((notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
-                    DeliverInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
+                    DeliverInputReport(notify.conn_id, notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
+                } else if (notify.conn_id != events::GetConnection()) {
+                    events::Log(g_le_hid_record);
                 } else {
                     if ((notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReportMap)) {
                         NoteReportMap(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
@@ -263,7 +418,7 @@ namespace ams::ble {
 
         /* Bring-up */
 
-        Result RegisterGattClient() {
+        Result RegisterGattClient(u8 *out_client_if) {
             events::SetRegistering(true);
             ON_SCOPE_EXIT { events::SetRegistering(false); };
 
@@ -276,7 +431,7 @@ namespace ams::ble {
                 R_THROW(svc::ResultTimedOut());
             }
 
-            g_client_if = e.info.client_registration.client_if;
+            *out_client_if = e.info.client_registration.client_if;
             R_SUCCEED();
         }
 
@@ -299,7 +454,7 @@ namespace ams::ble {
             }
 
             for (int attempt = 0; attempt < 3; ++attempt) {
-                if (R_SUCCEEDED(RegisterGattClient())) {
+                if (R_SUCCEEDED(RegisterGattClient(&g_client_if))) {
                     log::Write("registered gatt client_if=%u", g_client_if);
                     R_SUCCEED();
                 }
@@ -423,6 +578,74 @@ namespace ams::ble {
             events::LogAddress("auto-connect: saved controller", address);
         }
 
+        /* 8BitDo pads, known by address before they connect: they are given a spare GATT client so that the
+           first one, the only client on which an Xbox pad pairs (on any other the bond is refused within a second
+           and the link never encrypts), stays free */
+
+        constexpr const char EightBitDoDevicesPath[] = "sdmc:/config/MissionControl/ble_8bitdo_devices.bin";
+        constexpr size_t MaxEightBitDoDevices = 8;
+        constinit size_t g_eightbitdo_count = 0;
+        constinit bluetooth::Address g_eightbitdo_devices[MaxEightBitDoDevices] = {};
+
+        void LoadEightBitDoDevices() {
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), EightBitDoDevicesPath, fs::OpenMode_Read))) {
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+
+            size_t read = 0;
+            if (R_SUCCEEDED(fs::ReadFile(std::addressof(read), file, 0, g_eightbitdo_devices, sizeof(g_eightbitdo_devices)))) {
+                std::scoped_lock lk(g_autoconnect_lock);
+                g_eightbitdo_count = read / sizeof(bluetooth::Address);
+            }
+        }
+
+        bool IsKnownEightBitDo(const bluetooth::Address &address) {
+            // 8BitDo's own address block (OUI E4:17:D8), for a pad seen before it was ever presented here
+            if ((address.address[0] == 0xe4) && (address.address[1] == 0x17) && (address.address[2] == 0xd8)) {
+                return true;
+            }
+            std::scoped_lock lk(g_autoconnect_lock);
+            for (size_t i = 0; i < g_eightbitdo_count; ++i) {
+                if (AddressEqual(g_eightbitdo_devices[i], address)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void SaveEightBitDoDevice(const bluetooth::Address &address) {
+            bluetooth::Address addresses[MaxEightBitDoDevices];
+            size_t count;
+            {
+                std::scoped_lock lk(g_autoconnect_lock);
+                for (size_t i = 0; i < g_eightbitdo_count; ++i) {
+                    if (AddressEqual(g_eightbitdo_devices[i], address)) {
+                        return;
+                    }
+                }
+                // Most recent first; each pairing with the sync button gives the pad a new address
+                size_t n = 0;
+                addresses[n++] = address;
+                for (size_t i = 0; (i < g_eightbitdo_count) && (n < MaxEightBitDoDevices); ++i) {
+                    addresses[n++] = g_eightbitdo_devices[i];
+                }
+                std::memcpy(g_eightbitdo_devices, addresses, n * sizeof(bluetooth::Address));
+                g_eightbitdo_count = count = n;
+            }
+
+            const size_t size = count * sizeof(bluetooth::Address);
+            static_cast<void>(fs::CreateFile(EightBitDoDevicesPath, size));
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), EightBitDoDevicesPath, fs::OpenMode_Write))) {
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+            static_cast<void>(fs::SetFileSize(file, size));
+            static_cast<void>(fs::WriteFile(file, 0, addresses, size, fs::WriteOption::Flush));
+        }
+
         bool IsRememberedDevice(const bluetooth::Address &address) {
             std::scoped_lock lk(g_autoconnect_lock);
             for (size_t i = 0; i < g_remembered_count; ++i) {
@@ -447,12 +670,31 @@ namespace ams::ble {
 
         constexpr TimeSpan BackgroundScanDuration = TimeSpan::FromMilliSeconds(2500);
         constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(2000);
+        // Scanning shares the radio with the pads already connected; look for another one less often
+        constexpr TimeSpan BackgroundScanPauseLinked = TimeSpan::FromMilliSeconds(6000);
 
         // Covers one classic inquiry (10.24 s), during which the stack refuses connections
         constexpr TimeSpan ConnectRefusedRetryTime = TimeSpan::FromSeconds(12);
 
+        // A remembered controller that is not connected yet
+        bool HasUnlinkedRemembered() {
+            bluetooth::Address remembered[MaxRememberedDevices];
+            size_t count;
+            {
+                std::scoped_lock lk(g_autoconnect_lock);
+                count = g_remembered_count;
+                std::memcpy(remembered, g_remembered, sizeof(remembered));
+            }
+            for (size_t i = 0; i < count; ++i) {
+                if (!IsLinked(remembered[i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         bool BackgroundScanWanted() {
-            return AutoConnectEnabled() && g_have_remembered && events::IsRadioEnabled() && !events::IsPairingWindowOpen();
+            return AutoConnectEnabled() && g_have_remembered && events::IsRadioEnabled() && !events::IsPairingWindowOpen() && HasUnlinkedRemembered();
         }
 
         // Set when PrepareForSleep dropped the link: that end of link is no reason to cycle the radio on wake
@@ -480,6 +722,12 @@ namespace ams::ble {
 
             events::ClearSpareClientIf();
 
+            // BLE links do not survive the cycle; their controllers are withdrawn first
+            if (const size_t links = LinkCount(); links > 0) {
+                log::Write("radio cycle drops %u Bluetooth LE controller(s)", static_cast<u32>(links));
+                DropAllLinks();
+            }
+
             // Other controllers drop with the stack and reconnect on their own button; mc.mitm drops their stale
             // handlers when btm enables Bluetooth again (see BtdrvMitmService::EnableBluetooth)
             log::Write("radio cycle with %u other controller(s) connected", static_cast<u32>(controller::GetControllerCount()));
@@ -492,6 +740,7 @@ namespace ams::ble {
 
             events::Pump(TimeSpan::FromSeconds(6));
             g_pairing_failed_tick = 0;
+            g_extra_client_if = InvalidClientIf;
             g_cycle_pending = false;
 
             if (u8 spare = events::GetSpareClientIf(); spare != InvalidClientIf) {
@@ -512,7 +761,7 @@ namespace ams::ble {
             }
 
             for (int attempt = 0; attempt < 3; ++attempt) {
-                if (R_SUCCEEDED(RegisterGattClient())) {
+                if (R_SUCCEEDED(RegisterGattClient(&g_client_if))) {
                     log::Write("radio cycle: registered gatt client_if=%u", g_client_if);
                     return;
                 }
@@ -525,7 +774,7 @@ namespace ams::ble {
         /* Finding and connecting the controller */
 
         // With `only` set, nothing but that controller is accepted (background scans outside the pairing window)
-        Result Scan(bluetooth::Address *out_address, TimeSpan duration, bool only_remembered = false) {
+        Result Scan(bluetooth::Address *out_address, bool *out_eightbitdo, TimeSpan duration, bool only_remembered = false) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -587,6 +836,12 @@ namespace ams::ble {
                     if (r.info.scan_result.status != BleScanStatus_NewDevice) {
                         return false;
                     }
+                    if (IsLinked(r.info.scan_result.address)) {
+                        return false;
+                    }
+                    if (EightBitDoHeld() && IsKnownEightBitDo(r.info.scan_result.address)) {
+                        return false;
+                    }
                     if (only_remembered) {
                         return IsRememberedDevice(r.info.scan_result.address);
                     }
@@ -617,7 +872,12 @@ namespace ams::ble {
             R_UNLESS(found, svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
-            events::LogAddress("found controller", *out_address);
+            {
+                AdvertisementSummary summary;
+                ParseAdvertisements(e.info.scan_result.ad_list, e.info.scan_result.count, &summary);
+                *out_eightbitdo = (std::strncmp(summary.name, "8BitDo", 6) == 0) || IsKnownEightBitDo(*out_address);
+            }
+            events::LogAddress(*out_eightbitdo ? "found controller (8BitDo)" : "found controller", *out_address);
 
             if (log::IsEnabled()) {
                 SetSysBluetoothDevicesSettings settings;
@@ -648,7 +908,44 @@ namespace ams::ble {
             R_SUCCEED();
         }
 
-        Result Connect(const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout) {
+        // Asks for a link on the first client that takes it: the main one for an Xbox pad, a spare one for an
+        // 8BitDo pad (see LoadEightBitDoDevices); 1 and 2 refuse (0x300c71), btm's registrations from 3 up take it.
+        Result RequestLink(const bluetooth::Address &address, bool eightbitdo, u8 *out_client_if) {
+            u8 order[10];
+            size_t n = 0;
+            if (!eightbitdo) {
+                order[n++] = g_client_if;
+            }
+            if (g_extra_client_if != InvalidClientIf) {
+                order[n++] = g_extra_client_if;
+            }
+            for (u8 candidate = 3; candidate <= 8; ++candidate) {
+                order[n++] = candidate;
+            }
+            if (eightbitdo) {
+                order[n++] = g_client_if;
+            }
+
+            Result rc = ResultNoConnection();
+            for (size_t i = 0; i < n; ++i) {
+                const u8 client_if = order[i];
+                if ((client_if == InvalidClientIf) || ClientIfInUse(client_if) || std::find(order, order + i, client_if) != order + i) {
+                    continue;
+                }
+                rc = btdrvConnectGattServer(client_if, address, true, 0);
+                log::Write("btdrvConnectGattServer client_if=%u rc=0x%x", client_if, rc.GetValue());
+                if (R_SUCCEEDED(rc)) {
+                    if (client_if != g_client_if) {
+                        g_extra_client_if = client_if;
+                    }
+                    *out_client_if = client_if;
+                    R_SUCCEED();
+                }
+            }
+            R_RETURN(rc);
+        }
+
+        Result Connect(const bluetooth::Address &address, bool eightbitdo, u32 *out_conn_id, TimeSpan timeout) {
             events::SetTarget(&address);
 
             // A record left for this address, including the one a classic firmware left behind, is encrypted
@@ -661,19 +958,22 @@ namespace ams::ble {
             // keep asking until the inquiry is over instead of letting the pad give up.
             const auto deadline = os::GetSystemTick().ToTimeSpan() + ConnectRefusedRetryTime;
             int refused = 0;
+            u8 client_if = InvalidClientIf;
             for (;;) {
-                rc = btdrvConnectGattServer(g_client_if, address, true, 0);
-                if (refused == 0) {
-                    log::Write("btdrvConnectGattServer rc=0x%x", rc.GetValue());
+                if (client_if == InvalidClientIf) {
+                    rc = RequestLink(address, eightbitdo, &client_if);
+                } else {
+                    rc = btdrvConnectGattServer(client_if, address, true, 0);
                 }
                 R_TRY(rc);
+                g_setup_client_if = client_if;
 
                 const auto asked = os::GetSystemTick().ToTimeSpan();
                 rc = WaitForConnection(address, out_conn_id, timeout);
                 if (R_SUCCEEDED(rc)) {
                     break;
                 }
-                static_cast<void>(btdrvCancelConnectGattServer(g_client_if, address, true));
+                static_cast<void>(btdrvCancelConnectGattServer(client_if, address, true));
 
                 const auto now = os::GetSystemTick().ToTimeSpan();
                 const bool refused_at_once = ResultNoConnection::Includes(rc) && (now - asked) < TimeSpan::FromSeconds(1);
@@ -702,13 +1002,17 @@ namespace ams::ble {
             if (!events::TakeAdoptedConnection(out_address, out_conn_id)) {
                 return false;
             }
+            g_setup_client_if = g_client_if;
             log::Write("controller connected on its own, conn_id=%u", *out_conn_id);
             return true;
         }
 
+        constexpr s64 BondRefusedWithinMs = 2000;
+
         // The stack never pairs on its own: an authenticated request on an unbonded link just fails. Pairing is
         // Just Works and needs no confirmation from the controller.
         bool Pair(const bluetooth::Address &address) {
+            const auto asked = os::GetSystemTick();
             Result rc = btdrvCreateBond(address, BondTransport_Le);
             log::Write("btdrvCreateBond rc=0x%x", rc.GetValue());
             if (R_FAILED(rc)) {
@@ -726,8 +1030,15 @@ namespace ams::ble {
                 if (events::TakeBondComplete()) {
                     // A refusal drops the link within a few hundred milliseconds of this event
                     events::Pump(TimeSpan::FromMilliSeconds(500));
+                    // A bond takes about 5.7 s; the same event within a second is the stack turning the pairing
+                    // down (the link then never encrypts and every authenticated request fails)
+                    const s64 elapsed_ms = (os::GetSystemTick() - asked).ToTimeSpan().GetMilliSeconds();
+                    if (elapsed_ms < BondRefusedWithinMs) {
+                        log::Write("bond refused, reported after %ld ms", elapsed_ms);
+                        break;
+                    }
                     if (!events::IsDisconnected()) {
-                        log::Write("paired");
+                        log::Write("paired, bond reported after %ld ms", elapsed_ms);
                         return true;
                     }
                     break;
@@ -739,7 +1050,8 @@ namespace ams::ble {
 
         /* Presenting the controller to the system */
 
-        void Present(u32 conn_id, const bluetooth::Address &address, const gatt::HidService &hid) {
+        // Hands the link being set up over to the established links. Returns false when there is no free slot.
+        bool Present(u32 conn_id, const bluetooth::Address &address, const gatt::HidService &hid, bool paired, bool managed) {
             if (!hid.has_output_report) {
                 log::Write("no output Report characteristic, rumble unavailable");
             }
@@ -757,51 +1069,65 @@ namespace ams::ble {
             }
             {
                 std::scoped_lock lk(g_controller_lock);
-                g_controller = ble_controller;
-                g_switch_controller = controller;
-                g_parked = false;
-                g_present_tick = os::GetSystemTick().GetInt64Value();
+                Link *slot = nullptr;
+                for (auto &link : g_links) {
+                    if (!link.used) {
+                        slot = &link;
+                        break;
+                    }
+                }
+                if (!slot) {
+                    log::Write("no free controller slot");
+                    return false;
+                }
+                slot->used = true;
+                slot->conn_id = conn_id;
+                slot->client_if = g_setup_client_if;
+                slot->address = address;
+                slot->kind = g_controller_kind;
+                slot->paired = paired;
+                slot->managed = managed;
+                slot->controller = ble_controller;
+                slot->switch_controller = controller;
+                slot->present_tick = os::GetSystemTick().GetInt64Value();
+                ScheduleNeutralReports(*slot);
             }
+
+            // Watched as an established link from here on; the link's end is no longer the setup's
+            events::AddLink(address, conn_id);
+            const bool lost = events::IsDisconnected();
+            events::SetConnection(InvalidConnId);
+            events::SetTarget(nullptr);
+            events::SetCountManagedGattResults(false);
+
             controller::AttachVirtualController(controller);
             g_pairing_failed_tick = 0;
             SaveRememberedDevice(address);
+            if (g_controller_kind == ControllerKind_EightBitDo) {
+                SaveEightBitDoDevice(address);
+            } else {
+                g_eightbitdo_held_until = 0;
+            }
 
             // The pad only reports when something is touched, so its resting state (sticks centred, nothing
             // pressed) is delivered for it, now and again over the next seconds, see ScheduleNeutralReports
-            ScheduleNeutralReports();
             ServiceNeutralReports();
 
-            log::Write("controller presented to the system");
+            log::Write("controller presented to the system, %u connected", static_cast<u32>(LinkCount()));
+
+            // Dropped while being handed over: let the next service pass take it down
+            if (lost) {
+                static_cast<void>(TeardownLink(conn_id, true));
+            }
+            return true;
         }
 
-        void Dismiss(const bluetooth::Address &address) {
-            std::shared_ptr<controller::SwitchController> controller;
-            bool parked;
-            {
-                std::scoped_lock lk(g_controller_lock);
-                controller = std::move(g_switch_controller);
-                g_switch_controller = nullptr;
-                g_controller = nullptr;
-                parked = g_parked;
-                g_parked = false;
-                for (auto &due : g_neutral_due) {
-                    due = 0;
-                }
-            }
-
-            if (controller && !parked) {
-                controller::DetachVirtualController(address);
-                log::Write("controller removed from the system");
-            }
-        }
-
+        // Abandons the link being set up
         void Disconnect() {
             const u32 conn_id = events::GetConnection();
 
             bluetooth::Address address;
-            if (events::GetTarget(&address)) {
-                Dismiss(address);
-            }
+            const bool have_target = events::GetTarget(&address);
 
             // Nothing may touch the radio while the system has BLE switched off: it wakes the console
             if ((conn_id != InvalidConnId) && !events::IsDisconnected() && events::IsRadioEnabled()) {
@@ -813,35 +1139,53 @@ namespace ams::ble {
 
             events::SetConnection(InvalidConnId);
             events::SetTarget(nullptr);
-            events::SetClaimedAddress(nullptr);
-            events::SetInputSink(nullptr);
+            if (have_target) {
+                events::RemoveClaimedAddress(address);
+            }
             events::SetCountManagedGattResults(false);
-            if (g_managed_path) {
-                auto hid_uuid = MakeUuid16(GattServiceHid);
-                static_cast<void>(btdrvUnregisterGattManagedDataPath(&hid_uuid));
-                g_managed_path = false;
+            ReleaseManagedPath();
+        }
+
+        // Neutral reports for new controllers, and the ends of established links
+        void ServiceLinks() {
+            ServiceNeutralReports();
+
+            u32 conn_id;
+            u16 reason;
+            while (events::TakeLinkDown(&conn_id, &reason)) {
+                log::Write("controller disconnected conn_id=%u reason=0x%04x", conn_id, reason);
+                const bool paired = TeardownLink(conn_id, true);
+
+                // A radio cycle is the one thing that lets a bonded pad pair again (skipped when the link ended
+                // because the console is going to sleep). An 8BitDo pad never bonds and needs none.
+                if (!paired) {
+                    continue;
+                }
+                if (g_dropped_for_sleep) {
+                    log::Write("link was dropped for sleep, no radio cycle");
+                } else if (controller::GetControllerCount() > 0) {
+                    g_cycle_pending = true;
+                    log::Write("radio cycle put off: %u other controller(s) connected", static_cast<u32>(controller::GetControllerCount()));
+                } else {
+                    RecycleRadio();
+                }
+            }
+
+            if (LinkCount() == 0) {
+                g_dropped_for_sleep = false;
             }
         }
 
-        void RunConnected(u32 conn_id) {
+        // Waits while keeping the established links serviced
+        void Idle(TimeSpan duration) {
+            const auto deadline = os::GetSystemTick().ToTimeSpan() + duration;
             for (;;) {
-                events::Pump(TimeSpan::FromMilliSeconds(250));
-                ServiceNeutralReports();
-
-                if (gatt::TakeRediscovered()) {
-                    log::Write("services re-discovered, subscribing again");
-                    gatt::HidService hid;
-                    static_cast<void>(gatt::Subscribe(conn_id, &hid));
-                }
-
-                if (events::IsDisconnected()) {
-                    log::Write("controller disconnected reason=0x%04x", events::GetDisconnectReason());
+                ServiceLinks();
+                const auto now = os::GetSystemTick().ToTimeSpan();
+                if (now >= deadline) {
                     return;
                 }
-
-                if (!events::IsRadioEnabled()) {
-                    return;
-                }
+                events::Pump(std::min(deadline - now, TimeSpan::FromMilliSeconds(250)));
             }
         }
 
@@ -866,30 +1210,39 @@ namespace ams::ble {
 
             StartLeHidListener();
             events::SetSink(gatt::OnEvent);
+            events::SetInputSink(DeliverInputReport);
             LoadRememberedDevice();
+            LoadEightBitDoDevices();
 
             for (;;) {
                 WaitForRadio();
+                ServiceLinks();
+
+                if (LinkCount() >= MaxLinks) {
+                    Idle(TimeSpan::FromMilliSeconds(500));
+                    continue;
+                }
 
                 bluetooth::Address address;
                 u32 conn_id = InvalidConnId;
 
                 bool connected = Adopt(&address, &conn_id);
 
-                // Any gamepad in pairing mode while the Controllers screen is open; only the remembered one,
-                // in short bursts, the rest of the time
+                // Any gamepad in pairing mode while the Controllers screen is open; only remembered ones that are
+                // not connected yet, in short bursts, the rest of the time
                 const bool classic_busy = events::ClassicActivityWithin(ClassicActivityHoldOff);
                 const bool in_window = !classic_busy && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive();
                 const bool background = !classic_busy && !in_window && !PairingBackoffActive() && BackgroundScanWanted();
                 if (!connected && (in_window || background)) {
-                    Result rc = in_window ? Scan(&address, TimeSpan::FromSeconds(10)) : Scan(&address, BackgroundScanDuration, true);
+                    bool eightbitdo = false;
+                    Result rc = in_window ? Scan(&address, &eightbitdo, TimeSpan::FromSeconds(10)) : Scan(&address, &eightbitdo, BackgroundScanDuration, true);
                     if (Adopt(&address, &conn_id)) {
                         connected = true;
                     } else if (R_SUCCEEDED(rc)) {
                         if (background) {
                             log::Write("remembered controller is in pairing mode, connecting");
                         }
-                        connected = R_SUCCEEDED(Connect(address, &conn_id, TimeSpan::FromSeconds(15)));
+                        connected = R_SUCCEEDED(Connect(address, eightbitdo, &conn_id, TimeSpan::FromSeconds(15)));
                         if (!connected) {
                             Disconnect();
                         }
@@ -897,12 +1250,12 @@ namespace ams::ble {
                 }
 
                 if (!connected) {
-                    os::SleepThread(background ? BackgroundScanPause : TimeSpan::FromSeconds(2));
+                    Idle(!background ? TimeSpan::FromSeconds(2) : (LinkCount() > 0 ? BackgroundScanPauseLinked : BackgroundScanPause));
                     continue;
                 }
 
                 // Pairing traffic for this pad is answered on its behalf from here on
-                events::SetClaimedAddress(&address);
+                events::AddClaimedAddress(address);
 
                 gatt::Discover(conn_id, address);
 
@@ -910,7 +1263,7 @@ namespace ams::ble {
                 if (events::IsDisconnected()) {
                     log::Write("link lost during discovery reason=0x%04x", events::GetDisconnectReason());
                     Disconnect();
-                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    Idle(TimeSpan::FromSeconds(1));
                     continue;
                 }
 
@@ -925,19 +1278,37 @@ namespace ams::ble {
                     if (g_cycle_pending) {
                         g_cycle_pending = false;
                         log::Write("radio cycle deferred from the last link, doing it before pairing");
+                        HoldEightBitDo();
                         Disconnect();
                         RecycleRadio();
-                        os::SleepThread(TimeSpan::FromSeconds(3));
+                        Idle(TimeSpan::FromSeconds(3));
                         continue;
                     }
-                    if (!Pair(address)) {
+                    // The stack runs one LE pairing at a time, and an 8BitDo pad starts one it never finishes: with
+                    // an 8BitDo pad connected every Xbox bond was refused within 0.7 s (cancelling the 8BitDo bond
+                    // changed nothing), and a refused bond leaves the stack refusing the next ones until it is
+                    // restarted. So no attempt is made: the stack is restarted at once and the Xbox pad, still in
+                    // pairing mode, pairs before the 8BitDo pad is let back in.
+                    bluetooth::Address eightbitdo_addresses[MaxLinks];
+                    u32 eightbitdo_conn_ids[MaxLinks];
+                    if (GetEightBitDoLinks(eightbitdo_addresses, eightbitdo_conn_ids) > 0) {
+                        log::Write("8BitDo pad connected: restarting the stack so the Xbox pad can pair first");
+                        HoldEightBitDo();
+                        Disconnect();
+                        RecycleRadio();
+                        Idle(TimeSpan::FromSeconds(3));
+                        continue;
+                    }
+
+                    const bool bonded = Pair(address);
+                    if (!bonded) {
                         g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                         log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
                         Disconnect();
                         // A cycle clears the backoff: the next attempt is against a fresh stack. A connection asked for
                         // within a couple of seconds of the cycle fails to be established (0x3e), so let it settle.
                         RecycleRadio();
-                        os::SleepThread(TimeSpan::FromSeconds(3));
+                        Idle(TimeSpan::FromSeconds(3));
                         continue;
                     }
                     paired = true;
@@ -947,16 +1318,20 @@ namespace ams::ble {
                 // of our requests on it, then arrive on the LE HID event stream. That layer secures the link itself,
                 // and an 8BitDo pad never completes the pairing it starts: the stack drops the link when it times
                 // out 30 s later. Its service is used directly instead, over the managed BLE event stream.
-                const bool managed = (g_controller_kind == ControllerKind_EightBitDo);
-                events::SetCountManagedGattResults(managed);
-                events::SetInputSink(managed ? DeliverInputReport : nullptr);
+                // EXPERIMENT. Both registrations are by service UUID: with an 8BitDo and an Xbox pad connected at
+                // once, input is routed by connection to whichever pad it belongs to on either stream.
+                const bool managed = (g_controller_kind == ControllerKind_EightBitDo) && g_eightbitdo_managed;
+                // Results come back on whichever stream the service's registration routes them to
+                events::SetCountManagedGattResults(true);
                 auto hid_uuid = MakeUuid16(GattServiceHid);
                 Result rc;
                 if (managed) {
                     // Without a data path the stack reports nothing about the service at all
-                    rc = btdrvRegisterGattManagedDataPath(&hid_uuid);
-                    log::Write("btdrvRegisterGattManagedDataPath rc=0x%x", rc.GetValue());
-                    g_managed_path = R_SUCCEEDED(rc);
+                    if (!g_managed_path) {
+                        rc = btdrvRegisterGattManagedDataPath(&hid_uuid);
+                        log::Write("btdrvRegisterGattManagedDataPath rc=0x%x", rc.GetValue());
+                        g_managed_path = R_SUCCEEDED(rc);
+                    }
                 } else {
                     rc = btdrvRegisterGattHidDataPath(&hid_uuid);
                     log::Write("btdrvRegisterGattHidDataPath rc=0x%x", rc.GetValue());
@@ -976,28 +1351,17 @@ namespace ams::ble {
                 }
                 if (R_FAILED(rc)) {
                     log::Write("subscription failed rc=0x%x gatt_result=%u", rc.GetValue(), events::GetGattFailure());
+                    if ((g_controller_kind == ControllerKind_EightBitDo) && !managed) {
+                        g_eightbitdo_managed = true;
+                        log::Write("8BitDo pad goes back to the managed data path");
+                    }
                     Disconnect();
-                    os::SleepThread(TimeSpan::FromSeconds(1));
+                    Idle(TimeSpan::FromSeconds(1));
                     continue;
                 }
 
-                Present(conn_id, address, hid);
-                RunConnected(conn_id);
-
-                // Nothing beyond the teardown is asked of the stack once the link is gone: removing the bond and
-                // detaching the HID host layer here were both tried and changed nothing. A radio cycle is the one
-                // thing that lets a bonded pad pair again (skipped when the link ended because the console is going
-                // to sleep). An 8BitDo pad never bonds and needs none.
-                Disconnect();
-                if (paired) {
-                    if (controller::GetControllerCount() > 0 && !g_dropped_for_sleep) {
-                        g_cycle_pending = true;
-                        log::Write("radio cycle put off: %u other controller(s) connected", static_cast<u32>(controller::GetControllerCount()));
-                    } else {
-                        RecycleRadio();
-                    }
-                } else {
-                    g_dropped_for_sleep = false;
+                if (!Present(conn_id, address, hid, paired, managed)) {
+                    Disconnect();
                 }
             }
         }
@@ -1040,49 +1404,10 @@ namespace ams::ble {
     }
 
     void OnPairingWindow(bool open) {
-        // btm restarts its inquiry every 10 s while the screen stays open, and stops and restarts it within a
-        // few seconds when a controller connects; only a start after a quiet spell is the screen being opened.
-        // A controller that was presented from within the screen stays, as any newly paired controller does.
-        constexpr TimeSpan NewSessionGap = TimeSpan::FromSeconds(15);
-        static constinit s64 s_last_close_tick = 0;
-
-        const os::Tick now = os::GetSystemTick();
-        if (!open) {
-            // A parked controller comes back on its next button press, see LeHidThreadFunc
-            s_last_close_tick = now.GetInt64Value();
-            return;
-        }
-
-        // The screen is only inferred from btm's inquiry and was seen to withdraw the controller again right after
-        // LB+RB brought it back; it read as the controller dropping off the console. Left connected instead.
-        constexpr bool WithdrawOnControllersScreen = false;
-        if (!WithdrawOnControllersScreen) {
-            return;
-        }
-
-        if ((s_last_close_tick != 0) && ((now - os::Tick(s_last_close_tick)).ToTimeSpan() < NewSessionGap)) {
-            return;
-        }
-
-        std::shared_ptr<controller::SwitchController> controller;
-        std::shared_ptr<controller::BleHidController> ble_controller;
-        {
-            std::scoped_lock lk(g_controller_lock);
-            if (!g_switch_controller || g_parked || ((now - os::Tick(g_present_tick)).ToTimeSpan() < NewSessionGap)) {
-                return;
-            }
-            g_parked = true;
-            controller = g_switch_controller;
-            ble_controller = g_controller;
-            for (auto &due : g_neutral_due) {
-                due = 0;
-            }
-        }
-        if (ble_controller) {
-            ble_controller->StopRumble();
-        }
-        controller::DetachVirtualController(controller->Address());
-        log::Write("controller withdrawn while the Controllers screen is open, LB+RB brings it back");
+        // Controllers used to be withdrawn while the Controllers screen was open, as the screen does with every
+        // controller. The screen is only inferred from btm's inquiry and was seen to withdraw a controller again
+        // right after LB+RB brought it back; it read as the controller dropping off the console. Left connected.
+        AMS_UNUSED(open);
     }
 
     // EXPERIMENT. A controller left connected wakes the console a few seconds after it goes to sleep. The link
@@ -1098,21 +1423,35 @@ namespace ams::ble {
             return;
         }
 
-        const u32 conn_id = events::GetConnection();
-        if ((conn_id == InvalidConnId) || events::IsDisconnected()) {
+        u32 conn_ids[MaxLinks + 1];
+        size_t count = 0;
+        {
+            std::scoped_lock lk(g_controller_lock);
+            for (auto &link : g_links) {
+                if (link.used) {
+                    conn_ids[count++] = link.conn_id;
+                }
+            }
+        }
+        if (const u32 setup = events::GetConnection(); (setup != InvalidConnId) && !events::IsDisconnected()) {
+            conn_ids[count++] = setup;
+        }
+        if (count == 0) {
             log::Write("going to sleep, no link to drop");
             return;
         }
 
         g_dropped_for_sleep = true;
-        Result rc = btdrvDisconnectGattServer(conn_id);
-        log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_id, rc.GetValue());
+        for (size_t i = 0; i < count; ++i) {
+            Result rc = btdrvDisconnectGattServer(conn_ids[i]);
+            log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_ids[i], rc.GetValue());
+        }
 
-        // The disconnection is reported on btdrv's event thread, independently of the host thread
-        for (int i = 0; (i < 30) && !events::IsDisconnected(); ++i) {
+        // The disconnections are reported on btdrv's event thread, independently of the host thread
+        for (int i = 0; (i < 30) && (events::CountLinksUp() > 0); ++i) {
             os::SleepThread(TimeSpan::FromMilliSeconds(50));
         }
-        log::Write(events::IsDisconnected() ? "link down before sleep" : "link still up as sleep begins");
+        log::Write((events::CountLinksUp() == 0) ? "links down before sleep" : "a link is still up as sleep begins");
     }
 
 }

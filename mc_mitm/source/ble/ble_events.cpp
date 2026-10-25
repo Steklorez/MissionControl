@@ -52,8 +52,40 @@ namespace ams::ble::events {
         constinit u32 g_gatt_results = 0;
         constinit u32 g_gatt_failure = 0;
 
-        constinit bool g_have_claimed = false;
-        constinit bluetooth::Address g_claimed = {};
+        // Controllers whose pairing traffic is answered on their behalf (the one being set up and every
+        // established link)
+        constexpr size_t MaxClaimed = 4;
+        constinit bluetooth::Address g_claimed[MaxClaimed] = {};
+        constinit size_t g_claimed_count = 0;
+
+        // Established links, each watched for its end independently of the one being set up
+        struct LinkState {
+            bool used;
+            bluetooth::Address address;
+            u32 conn_id;
+            bool down;
+            u16 reason;
+        };
+        constexpr size_t MaxLinks = 4;
+        constinit LinkState g_links[MaxLinks] = {};
+
+        bool IsLinkConnIdLocked(u32 conn_id) {
+            for (auto &link : g_links) {
+                if (link.used && (link.conn_id == conn_id)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool IsClaimedLocked(const bluetooth::Address &address) {
+            for (size_t i = 0; i < g_claimed_count; ++i) {
+                if (AddressEqual(g_claimed[i], address)) {
+                    return true;
+                }
+            }
+            return false;
+        }
 
         constinit bool g_have_attempted = false;
         constinit bluetooth::Address g_attempted = {};
@@ -102,19 +134,21 @@ namespace ams::ble::events {
             auto &notify = info->client_notify;
             InputSink sink;
             bool count_results;
-            u32 conn_id;
+            bool setup_link, established;
             {
                 std::scoped_lock lk(g_lock);
                 sink = g_active ? g_input_sink : nullptr;
                 count_results = g_active && g_count_managed_results;
-                conn_id = g_conn_id;
+                setup_link = (g_conn_id != InvalidConnId) && (notify.conn_id == g_conn_id);
+                established = IsLinkConnIdLocked(notify.conn_id);
             }
-            if (notify.conn_id == conn_id) {
+            if (setup_link || established) {
                 if (sink && (notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
-                    sink(notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
+                    sink(notify.conn_id, notify.data, std::min<size_t>(notify.size, sizeof(notify.data)));
                     return true;
                 }
-                if (count_results && (notify.type != GattNotifyType_Notification)) {
+                // Only the link being set up waits on results; an established pad's rumble writes must not count
+                if (setup_link && count_results && (notify.type != GattNotifyType_Notification)) {
                     NoteGattResult(notify.result);
                 }
             }
@@ -164,6 +198,15 @@ namespace ams::ble::events {
                 g_disconnect_reason = connection.reason;
             }
 
+            if (!connected) {
+                for (auto &link : g_links) {
+                    if (link.used && !link.down && AddressEqual(link.address, connection.address)) {
+                        link.down = true;
+                        link.reason = connection.reason;
+                    }
+                }
+            }
+
             if (ours && connected && !g_have_target && g_have_attempted && AddressEqual(connection.address, g_attempted)) {
                 g_adopted = true;
                 g_adopted_address = connection.address;
@@ -186,8 +229,10 @@ namespace ams::ble::events {
     }
 
     bool OnCoreEvent(u32 type, const bluetooth::EventInfo *info) {
-        bool have_target, have_claimed;
-        bluetooth::Address target, claimed;
+        bool have_target;
+        bluetooth::Address target;
+        bluetooth::Address claimed[MaxClaimed];
+        size_t claimed_count;
         {
             std::scoped_lock lk(g_lock);
             if (!g_owns_ble) {
@@ -195,16 +240,25 @@ namespace ams::ble::events {
             }
             have_target = g_have_target;
             target = g_target;
-            have_claimed = g_have_claimed;
-            claimed = g_claimed;
+            claimed_count = g_claimed_count;
+            std::memcpy(claimed, g_claimed, sizeof(claimed));
         }
+        const bool have_claimed = claimed_count > 0;
 
         if (hos::GetVersion() < hos::Version_12_0_0) {
             return false;
         }
 
         const auto is_ours = [&](const bluetooth::Address &address) {
-            return (have_target && AddressEqual(address, target)) || (have_claimed && AddressEqual(address, claimed));
+            if (have_target && AddressEqual(address, target)) {
+                return true;
+            }
+            for (size_t i = 0; i < claimed_count; ++i) {
+                if (AddressEqual(address, claimed[i])) {
+                    return true;
+                }
+            }
+            return false;
         };
 
         // EXPERIMENT. Which pairing traffic a controller that is connected but not bonded raises
@@ -251,7 +305,8 @@ namespace ams::ble::events {
             log::Write("core evt Connection type=%u for the controller (%02x %02x %02x %02x %02x %02x %02x %02x)", connection.type,
                 connection.reserved[0], connection.reserved[1], connection.reserved[2], connection.reserved[3], connection.reserved[4], connection.reserved[5], connection.reserved[6], connection.reserved[7]);
             LogAddress("  address", connection.addr);
-            if (connection.type == CoreConnectionType_Suspended) {
+            // Only a bond being set up is waited for
+            if ((connection.type == CoreConnectionType_Suspended) && have_target && AddressEqual(connection.addr, target)) {
                 std::scoped_lock lk(g_lock);
                 g_bond_complete = true;
             }
@@ -393,14 +448,65 @@ namespace ams::ble::events {
         return g_adopted;
     }
 
-    void SetClaimedAddress(const bluetooth::Address *address) {
+    void AddClaimedAddress(const bluetooth::Address &address) {
         std::scoped_lock lk(g_lock);
-        if (address) {
-            g_claimed = *address;
-            g_have_claimed = true;
-        } else {
-            g_have_claimed = false;
+        if (!IsClaimedLocked(address) && (g_claimed_count < MaxClaimed)) {
+            g_claimed[g_claimed_count++] = address;
         }
+    }
+
+    void RemoveClaimedAddress(const bluetooth::Address &address) {
+        std::scoped_lock lk(g_lock);
+        for (size_t i = 0; i < g_claimed_count; ++i) {
+            if (AddressEqual(g_claimed[i], address)) {
+                g_claimed[i] = g_claimed[--g_claimed_count];
+                return;
+            }
+        }
+    }
+
+    void AddLink(const bluetooth::Address &address, u32 conn_id) {
+        std::scoped_lock lk(g_lock);
+        for (auto &link : g_links) {
+            if (!link.used) {
+                link = { .used = true, .address = address, .conn_id = conn_id, .down = false, .reason = 0 };
+                return;
+            }
+        }
+    }
+
+    void RemoveLink(u32 conn_id) {
+        std::scoped_lock lk(g_lock);
+        for (auto &link : g_links) {
+            if (link.used && (link.conn_id == conn_id)) {
+                link.used = false;
+            }
+        }
+    }
+
+    size_t CountLinksUp() {
+        std::scoped_lock lk(g_lock);
+        size_t count = 0;
+        for (auto &link : g_links) {
+            count += (link.used && !link.down) ? 1 : 0;
+        }
+        if ((g_conn_id != InvalidConnId) && !g_disconnected) {
+            ++count;
+        }
+        return count;
+    }
+
+    bool TakeLinkDown(u32 *out_conn_id, u16 *out_reason) {
+        std::scoped_lock lk(g_lock);
+        for (auto &link : g_links) {
+            if (link.used && link.down) {
+                *out_conn_id = link.conn_id;
+                *out_reason = link.reason;
+                link.down = false;
+                return true;
+            }
+        }
+        return false;
     }
 
     void SetInquiryActive(bool active) {

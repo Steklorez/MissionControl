@@ -55,9 +55,10 @@ namespace ams::ble::events {
     u32 GetGattFailure();       // last non-zero result since ClearGattFailure
     void ClearGattFailure();
 
-    // Input Report notifications for the connected pad when its HID service is not handed to the stack's HID
-    // host layer (they then arrive on the managed BLE event stream); called from the btdrv event thread
-    using InputSink = void (*)(const u8 *data, size_t size);
+    // Input Report notifications for a connected pad (the one being set up or an established link) when its
+    // HID service is not handed to the stack's HID host layer (they then arrive on the managed BLE event
+    // stream); called from the btdrv event thread
+    using InputSink = void (*)(u32 conn_id, const u8 *data, size_t size);
     void SetInputSink(InputSink sink);
     // GATT results on the managed stream are counted as the LE HID ones are, see NoteGattResult
     void SetCountManagedGattResults(bool count);
@@ -67,8 +68,17 @@ namespace ams::ble::events {
     bool TakeAdoptedConnection(bluetooth::Address *out_address, u32 *out_conn_id);
     bool HasAdoptedConnection();
 
-    // The remembered controller, whose pairing requests are answered on its behalf
-    void SetClaimedAddress(const bluetooth::Address *address);
+    // Controllers whose pairing requests are answered on their behalf
+    void AddClaimedAddress(const bluetooth::Address &address);
+    void RemoveClaimedAddress(const bluetooth::Address &address);
+
+    // Established links: their ends are recorded from the btdrv event thread while the host thread is busy
+    // setting up another one (the target above)
+    void AddLink(const bluetooth::Address &address, u32 conn_id);
+    void RemoveLink(u32 conn_id);
+    bool TakeLinkDown(u32 *out_conn_id, u16 *out_reason);
+    // Established links not yet down, and the link being set up
+    size_t CountLinksUp();
 
     // btm runs classic inquiry while the Controllers screen is open; that is the window for pairing new pads
     void SetInquiryActive(bool active);
