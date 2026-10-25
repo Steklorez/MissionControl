@@ -28,9 +28,9 @@ namespace ams::controller {
         constexpr u8 TriggerMax = UINT8_MAX;
 
         constexpr float AccelPerG = 4096.0f;
-        // Measured against the console's own Joy-Con on the same quarter turns (with the packer's
-        // GyroOutputScale applied); the usual +-2000 dps scale of 16.4 reads about 5% short
-        constexpr float GyroPerDps = 15.5f;
+        // Measured against the console's own Joy-Con on the same quarter turns: 16.4 (the usual
+        // +-2000 dps scale) read about 18% short
+        constexpr float GyroPerDps = 13.4f;
 
         // Raw readings below this count as the pad lying still, for tracking the gyroscope's resting offset
         constexpr float GyroRestThreshold = 40.0f;

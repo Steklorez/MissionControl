@@ -27,12 +27,6 @@ namespace ams::controller {
         constexpr float BaseAccelSensitivity = 4.0f / (16384 - 0); // 16384 and 0 (offset, would technically need to be done for each axis) match the factory_motion_calibration value in the SPI flash
 
         constexpr float GyroSensitivities[] = { BaseGyroSensitivity / 8, BaseGyroSensitivity / 4, BaseGyroSensitivity / 2, BaseGyroSensitivity };
-
-        // Measured on the console: with the scale above, quarter turns read about 82% of what the accelerometer
-        // saw, from a DualShock 4 (scaled by its own factory calibration) as from an 8BitDo pad, where a Joy-Con
-        // on the same test reads 94%. The system evidently reads the packed values against something other
-        // than 936 dps per 13371; scale them up to match.
-        constexpr float GyroOutputScale = 1.16f;
         constexpr float AccelSensitivities[] = { BaseAccelSensitivity, BaseAccelSensitivity / 2, BaseAccelSensitivity / 4, BaseAccelSensitivity * 2};
 
     }
@@ -55,9 +49,9 @@ namespace ams::controller {
         motion_data->standard.accel_2 = accel_scaled;
 
         const Vec3d<s16> gyro_scaled = {
-            .x = static_cast<s16>(std::clamp<float>(gyro.x * GyroOutputScale / GyroSensitivities[m_gyro_sensitivity], INT16_MIN, INT16_MAX)),
-            .y = static_cast<s16>(std::clamp<float>(gyro.y * GyroOutputScale / GyroSensitivities[m_gyro_sensitivity], INT16_MIN, INT16_MAX)),
-            .z = static_cast<s16>(std::clamp<float>(gyro.z * GyroOutputScale / GyroSensitivities[m_gyro_sensitivity], INT16_MIN, INT16_MAX))
+            .x = static_cast<s16>(std::clamp<float>(gyro.x / GyroSensitivities[m_gyro_sensitivity], INT16_MIN, INT16_MAX)),
+            .y = static_cast<s16>(std::clamp<float>(gyro.y / GyroSensitivities[m_gyro_sensitivity], INT16_MIN, INT16_MAX)),
+            .z = static_cast<s16>(std::clamp<float>(gyro.z / GyroSensitivities[m_gyro_sensitivity], INT16_MIN, INT16_MAX))
         };
 
         motion_data->standard.gyro_0 = gyro_scaled;
