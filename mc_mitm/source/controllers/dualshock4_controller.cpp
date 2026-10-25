@@ -13,6 +13,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <cmath>
 #include "dualshock4_controller.hpp"
 #include "../mcmitm_config.hpp"
 #include <switch.h>
@@ -173,9 +174,19 @@ namespace ams::controller {
         m_accel.y = -src->input0x11.acc_x / float(m_motion_calibration.acc.x_max);
         m_accel.z =  src->input0x11.acc_y / float(m_motion_calibration.acc.y_max);
 
-        m_gyro.x = -(src->input0x11.vel_z - m_motion_calibration.gyro.roll_bias)  / ((m_motion_calibration.gyro.roll_max  - m_motion_calibration.gyro.roll_bias)  / m_motion_calibration.gyro.speed_max);
-        m_gyro.y = -(src->input0x11.vel_x - m_motion_calibration.gyro.pitch_bias) / ((m_motion_calibration.gyro.pitch_max - m_motion_calibration.gyro.pitch_bias) / m_motion_calibration.gyro.speed_max);
-        m_gyro.z =  (src->input0x11.vel_y - m_motion_calibration.gyro.yaw_bias)   / ((m_motion_calibration.gyro.yaw_max   - m_motion_calibration.gyro.yaw_bias)   / m_motion_calibration.gyro.speed_max);
+        // Degrees per second per raw unit, as the kernel's hid-sony/hid-playstation drivers take it from the
+        // calibration: both turn directions and both speeds. Kept in float: integer maths here truncated every
+        // reading to whole degrees per second.
+        const auto &cal = m_motion_calibration.gyro;
+        const float speed = float(cal.speed_max) + float(cal.speed_min);
+        const auto scale = [speed](s16 max, s16 min, s16 bias) {
+            const float span = std::abs(float(max) - bias) + std::abs(float(min) - bias);
+            return span > 0 ? speed / span : 0.0f;
+        };
+
+        m_gyro.x = -(float(src->input0x11.vel_z) - cal.roll_bias)  * scale(cal.roll_max,  cal.roll_min,  cal.roll_bias);
+        m_gyro.y = -(float(src->input0x11.vel_x) - cal.pitch_bias) * scale(cal.pitch_max, cal.pitch_min, cal.pitch_bias);
+        m_gyro.z =  (float(src->input0x11.vel_y) - cal.yaw_bias)   * scale(cal.yaw_max,   cal.yaw_min,   cal.yaw_bias);
     }
 
     void Dualshock4Controller::MapButtons(const Dualshock4ButtonData *buttons) {
