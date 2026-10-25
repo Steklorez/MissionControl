@@ -28,9 +28,10 @@ namespace ams::controller {
         constexpr u8 TriggerMax = UINT8_MAX;
 
         constexpr float AccelPerG = 4096.0f;
-        // A +-2000 dps gyroscope. It once looked 18% short, which was the quaternion timestamps (see
-        // switch_motion_packing.cpp), not this scale.
-        constexpr float GyroPerDps = 16.4f;
+        // Nominally a +-2000 dps gyroscope (16.4), which reads 6% short of the system's own orientation on
+        // quarter turns (a DualShock 4 on its factory calibration matches it exactly). An earlier 18% shortfall
+        // was the quaternion timestamps (see switch_motion_packing.cpp), not this scale.
+        constexpr float GyroPerDps = 15.4f;
 
         // Raw readings below this count as the pad lying still, for tracking the gyroscope's resting offset
         constexpr float GyroRestThreshold = 40.0f;
