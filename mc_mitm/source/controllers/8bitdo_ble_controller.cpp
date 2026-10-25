@@ -27,6 +27,14 @@ namespace ams::controller {
 
         constexpr u8 TriggerMax = UINT8_MAX;
 
+        constexpr float AccelPerG = 4096.0f;
+        // A +-2000 dps gyroscope (a quarter turn integrated to about 1440 raw units x seconds)
+        constexpr float GyroPerDps = 16.4f;
+
+        // Raw readings below this count as the pad lying still, for tracking the gyroscope's resting offset
+        constexpr float GyroRestThreshold = 40.0f;
+        constexpr float GyroBiasRate = 0.01f;
+
         constexpr u8 DpadReleased = 0x0f;
 
         // Usage Page (Generic Desktop), Usage (Game Pad), Collection (Application), Report ID (1), Usage (Hat switch)
@@ -132,7 +140,34 @@ namespace ams::controller {
 
         if (report->size >= sizeof(EightBitDoBleInputReport0x01) + 1) {
             m_battery = convert_battery_100(std::min<u8>(src->battery, 100));
+            this->MapMotion(src);
         }
+    }
+
+    void EightBitDoBleController::MapMotion(const EightBitDoBleInputReport0x01 *src) {
+        // The pad's axes are the Switch's: x forward, y left, z up (measured: 1 g on +x with the triggers up,
+        // on -y with the right grip up, on +z lying face up; +z rotation turning it left on the table)
+        float gyro[3];
+        bool resting = true;
+        for (int i = 0; i < 3; ++i) {
+            gyro[i] = src->gyro[i] - m_gyro_bias[i];
+            resting &= std::abs(gyro[i]) < GyroRestThreshold;
+        }
+
+        // The gyroscope reads a little off zero at rest (about 1 dps); follow that while the pad is still
+        if (resting) {
+            for (int i = 0; i < 3; ++i) {
+                m_gyro_bias[i] += gyro[i] * GyroBiasRate;
+            }
+        }
+
+        m_accel.x = src->accel[0] / AccelPerG;
+        m_accel.y = src->accel[1] / AccelPerG;
+        m_accel.z = src->accel[2] / AccelPerG;
+
+        m_gyro.x = gyro[0] / GyroPerDps;
+        m_gyro.y = gyro[1] / GyroPerDps;
+        m_gyro.z = gyro[2] / GyroPerDps;
     }
 
     void EightBitDoBleController::HandleVolumeButtons(bool down, bool up) {

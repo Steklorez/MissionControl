@@ -53,7 +53,10 @@ namespace ams::controller {
         EightBitDoBleButtonData buttons;
         u8 _unk0[3];
         u8 battery;
-        u8 _unk1[19];
+        // Accelerometer at 4096 per g (1 g on z with the pad lying face up), then the gyroscope
+        s16 accel[3];
+        s16 gyro[3];
+        u8 _unk1[7];
     } PACKED;
 
     struct EightBitDoBleOutputReport0x05 {
@@ -96,6 +99,7 @@ namespace ams::controller {
         private:
             Result WriteRumble(u8 strong, u8 weak);
             void HandleVolumeButtons(bool down, bool up);
+            void MapMotion(const EightBitDoBleInputReport0x01 *src);
 
             u32 m_conn_id;
             BtdrvGattId m_service_id;
@@ -107,6 +111,8 @@ namespace ams::controller {
 
             bool m_volume_down = false;
             bool m_volume_up = false;
+
+            float m_gyro_bias[3] = {};
 
             bluetooth::HidReportEventInfo m_event_info;
     };

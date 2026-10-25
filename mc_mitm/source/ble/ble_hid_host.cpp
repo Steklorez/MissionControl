@@ -187,11 +187,14 @@ namespace ams::ble {
             if (!controller) {
                 return;
             }
-            // Debug: raw button bytes whenever they change, to map the extra buttons
-            static u8 last_buttons[6];
-            if ((size >= 13) && (std::memcmp(last_buttons, &data[7], sizeof(last_buttons)) != 0)) {
-                std::memcpy(last_buttons, &data[7], sizeof(last_buttons));
-                log::Write("buttons %02x %02x %02x | %02x %02x %02x", data[7], data[8], data[9], data[10], data[11], data[12]);
+            // Debug: the report's non-analog bytes whenever they change (hat, buttons, vendor bytes, tail)
+            static u8 last_bytes[8];
+            if (size >= 33) {
+                const u8 bytes[8] = { data[0], data[7], data[8], data[9], data[10], data[11], data[12], data[32] };
+                if (std::memcmp(last_bytes, bytes, sizeof(bytes)) != 0) {
+                    std::memcpy(last_bytes, bytes, sizeof(bytes));
+                    log::Write("buttons hat=%02x %02x %02x %02x | %02x %02x %02x | tail %02x", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+                }
             }
             if (parked) {
                 // What brings a controller back on the Controllers screen is L+R; afterwards any button does
