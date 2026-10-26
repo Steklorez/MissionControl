@@ -40,6 +40,8 @@ namespace ams::ble {
     // is still awake: drops the controller's link so nothing is left on the air to wake the console, then marks
     // the radio unavailable to the host.
     void PrepareForSleep();
+    // btm switching the radio off or on (Bluetooth in the settings, flight mode)
+    void OnBluetoothRadio(bool on);
 
     // Called from the btdrv mitm when btm starts or stops searching for controllers, which it does while the
     // Controllers screen is open. A connected controller is then withdrawn from hid, as the screen does with

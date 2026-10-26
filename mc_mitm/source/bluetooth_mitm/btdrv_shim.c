@@ -27,6 +27,11 @@ Result btdrvEnableBluetoothFwd(Service* srv) {
     return serviceMitmDispatch(srv, 2);
 }
 
+Result btdrvEnableRadioFwd(Service* srv, bool enable) {
+    const u8 in = enable != 0;
+    return serviceMitmDispatchIn(srv, 34, in);
+}
+
 Result btdrvInitializeHidFwd(Service* srv, Handle *out_handle, u16 version) {
     return serviceMitmDispatchIn(srv, 16, version,
         .out_handle_attrs = { SfOutHandleAttr_HipcCopy },

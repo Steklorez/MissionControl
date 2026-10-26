@@ -95,6 +95,10 @@ namespace ams::ble::events {
 
     // The console's sleep state (from the psc power module): no radio activity is allowed while asleep
     void SetRadioEnabled(bool enabled);
+    // Bluetooth switched off or on in the settings (btdrv EnableRadio from btm)
+    void SetBluetoothOn(bool on);
+    bool IsBluetoothOn();
+    bool IsAwake();
     bool IsRadioEnabled();
     void WaitRadioEnabled();
     bool TakeRadioCycled();

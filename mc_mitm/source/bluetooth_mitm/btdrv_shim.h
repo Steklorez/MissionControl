@@ -22,6 +22,7 @@ extern "C" {
 
 Result btdrvInitializeBluetoothFwd(Service* srv, Handle *out_handle);
 Result btdrvEnableBluetoothFwd(Service* srv);
+Result btdrvEnableRadioFwd(Service* srv, bool enable);
 Result btdrvInitializeHidFwd(Service* srv, Handle *out_handle, u16 version);
 Result btdrvWriteHidDataFwd(Service* srv, BtdrvAddress address, const BtdrvHidReport *report);
 Result btdrvWriteHidData2Fwd(Service* srv, BtdrvAddress address, const void *data, size_t size);

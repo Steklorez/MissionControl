@@ -250,7 +250,8 @@ namespace ams::ble {
             if (!link_down && events::IsRadioEnabled()) {
                 static_cast<void>(btdrvDisconnectGattServer(conn_id));
             }
-            if (removed.controller) {
+            // A rumble write would touch the radio, which wakes a sleeping console
+            if (removed.controller && events::IsRadioEnabled()) {
                 removed.controller->StopRumble();
             }
             if (removed.switch_controller) {
@@ -471,6 +472,25 @@ namespace ams::ble {
         void WaitForRadio() {
             bool woke = false;
             if (!events::IsRadioEnabled()) {
+                // Bluetooth switched off or the console going to sleep: the links are gone or about to be, and
+                // nothing is asked of the radio until it is back
+                if (const size_t links = LinkCount(); links > 0) {
+                    log::Write("radio off, withdrawing %u controller(s)", static_cast<u32>(links));
+                    u32 conn_ids[MaxLinks];
+                    size_t count = 0;
+                    {
+                        std::scoped_lock lk(g_controller_lock);
+                        for (auto &link : g_links) {
+                            if (link.used) {
+                                conn_ids[count++] = link.conn_id;
+                            }
+                        }
+                    }
+                    // The links were closed before the radio went off (see PrepareForSleep, OnBluetoothRadio)
+                    for (size_t i = 0; i < count; ++i) {
+                        static_cast<void>(TeardownLink(conn_ids[i], true, true));
+                    }
+                }
                 log::Write("ble switched off by the system, waiting");
                 events::WaitRadioEnabled();
                 log::Write("ble switched back on");
@@ -1414,6 +1434,48 @@ namespace ams::ble {
     // is dropped here, from the power module thread, while the bluetooth module is still awake (it is listed as
     // a dependency of ours), so that nothing is left on the air by the time the radio goes down. The host thread
     // sees the radio marked unavailable and stays off it until FullAwake.
+    namespace {
+
+        // Drops every link while the radio can still be used; the host thread stays off the radio until it is
+        // marked usable again
+        void DropLinksBeforeRadioOff() {
+            u32 link_ids[MaxLinks];
+            size_t link_count = 0;
+            {
+                std::scoped_lock lk(g_controller_lock);
+                for (auto &link : g_links) {
+                    if (link.used) {
+                        link_ids[link_count++] = link.conn_id;
+                    }
+                }
+            }
+            u32 conn_ids[MaxLinks + 1];
+            size_t count = 0;
+            for (size_t i = 0; i < link_count; ++i) {
+                conn_ids[count++] = link_ids[i];
+            }
+            if (const u32 setup = events::GetConnection(); (setup != InvalidConnId) && !events::IsDisconnected()) {
+                conn_ids[count++] = setup;
+            }
+            if (count == 0) {
+                log::Write("radio going off, no link to drop");
+                return;
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                Result rc = btdrvDisconnectGattServer(conn_ids[i]);
+                log::Write("radio going off: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_ids[i], rc.GetValue());
+            }
+
+            // The disconnections are reported on btdrv's event thread, independently of the host thread
+            for (int i = 0; (i < 30) && (events::CountLinksUp() > 0); ++i) {
+                os::SleepThread(TimeSpan::FromMilliSeconds(50));
+            }
+            log::Write((events::CountLinksUp() == 0) ? "links down" : "a link is still up as the radio goes off");
+        }
+
+    }
+
     void PrepareForSleep() {
         const bool was_enabled = events::IsRadioEnabled();
         events::SetRadioEnabled(false);
@@ -1423,35 +1485,24 @@ namespace ams::ble {
             return;
         }
 
-        u32 conn_ids[MaxLinks + 1];
-        size_t count = 0;
-        {
-            std::scoped_lock lk(g_controller_lock);
-            for (auto &link : g_links) {
-                if (link.used) {
-                    conn_ids[count++] = link.conn_id;
-                }
-            }
-        }
-        if (const u32 setup = events::GetConnection(); (setup != InvalidConnId) && !events::IsDisconnected()) {
-            conn_ids[count++] = setup;
-        }
-        if (count == 0) {
-            log::Write("going to sleep, no link to drop");
+        g_dropped_for_sleep = true;
+        DropLinksBeforeRadioOff();
+    }
+
+    // Bluetooth switched off in the settings only stops classic Bluetooth: the BLE links went on working. Called
+    // from btm's request before it is passed on: the links are closed while the radio still runs (a disconnection
+    // asked for once it is off only happens when it comes back), which only waits on the bluetooth module. The
+    // controllers are withdrawn by the host thread (see WaitForRadio): withdrawing one signals btm, which is
+    // waiting on this very request, and doing it here hung the console.
+    void OnBluetoothRadio(bool on) {
+        if (!g_launched) {
             return;
         }
-
-        g_dropped_for_sleep = true;
-        for (size_t i = 0; i < count; ++i) {
-            Result rc = btdrvDisconnectGattServer(conn_ids[i]);
-            log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_ids[i], rc.GetValue());
+        if (!on && events::IsRadioEnabled()) {
+            log::Write("bluetooth switched off in the settings, closing the links");
+            DropLinksBeforeRadioOff();
         }
-
-        // The disconnections are reported on btdrv's event thread, independently of the host thread
-        for (int i = 0; (i < 30) && (events::CountLinksUp() > 0); ++i) {
-            os::SleepThread(TimeSpan::FromMilliSeconds(50));
-        }
-        log::Write((events::CountLinksUp() == 0) ? "links down before sleep" : "a link is still up as sleep begins");
+        events::SetBluetoothOn(on);
     }
 
 }

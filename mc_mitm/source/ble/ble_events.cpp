@@ -95,6 +95,9 @@ namespace ams::ble::events {
         constinit u32 g_adopted_conn_id = InvalidConnId;
 
         constinit bool g_radio_enabled = false;
+        // The radio is usable while the console is awake and Bluetooth is switched on in the settings
+        constinit bool g_awake = false;
+        constinit bool g_bluetooth_on = true;
         constinit bool g_radio_cycled = false;
 
         constinit s64 g_inquiry_started_tick = 0;
@@ -110,6 +113,21 @@ namespace ams::ble::events {
             FormatUuid(attr.id.uuid, uuid, sizeof(uuid));
             log::Write("  attr type=%u handle=0x%04x end=0x%04x inst=%u prop=0x%02x primary=%u uuid=%s",
                 attr.type, attr.handle, attr.group_end_handle, attr.id.instance_id, attr.property, attr.is_primary, uuid);
+        }
+
+        // Called with g_lock held
+        void UpdateRadioLocked() {
+            const bool enabled = g_awake && g_bluetooth_on;
+            if (enabled) {
+                if (!g_radio_enabled) {
+                    g_radio_cycled = true;
+                }
+                g_radio_enabled = true;
+                g_radio_event.Signal();
+            } else {
+                g_radio_enabled = false;
+                g_radio_event.Clear();
+            }
         }
 
         bool IsConnectionFamily(bluetooth::BleEventType type) {
@@ -324,8 +342,8 @@ namespace ams::ble::events {
     void TakeOwnership() {
         std::scoped_lock lk(g_lock);
         g_owns_ble = true;
-        g_radio_enabled = true;
-        g_radio_event.Signal();
+        g_awake = true;
+        UpdateRadioLocked();
     }
 
     void SetRegistering(bool registering) {
@@ -547,16 +565,24 @@ namespace ams::ble::events {
 
     void SetRadioEnabled(bool enabled) {
         std::scoped_lock lk(g_lock);
-        if (enabled) {
-            if (!g_radio_enabled) {
-                g_radio_cycled = true;
-            }
-            g_radio_enabled = true;
-            g_radio_event.Signal();
-        } else {
-            g_radio_enabled = false;
-            g_radio_event.Clear();
-        }
+        g_awake = enabled;
+        UpdateRadioLocked();
+    }
+
+    bool IsAwake() {
+        std::scoped_lock lk(g_lock);
+        return g_awake;
+    }
+
+    bool IsBluetoothOn() {
+        std::scoped_lock lk(g_lock);
+        return g_bluetooth_on;
+    }
+
+    void SetBluetoothOn(bool on) {
+        std::scoped_lock lk(g_lock);
+        g_bluetooth_on = on;
+        UpdateRadioLocked();
     }
 
     bool IsRadioEnabled() {

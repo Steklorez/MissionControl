@@ -23,7 +23,7 @@ namespace ams::controller {
         constexpr double QuatScaleFactor = std::numbers::pi / 180.0f / 1000000000.0f;
 
         // Measured, see PackGyroFixedPrecision
-        constexpr s64 QuaternionTimestampUnitNs = 1230000;
+        constexpr s64 QuaternionTimestampUnitNs = 1250000;
 
         // See https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/issues/18#issuecomment-331324555
         constexpr float BaseGyroSensitivity = 936.0f / (13371 - 0); // 13371 and 0 (offset, would technically need to be done for each axis) match the factory_motion_calibration value in the SPI flash
@@ -156,7 +156,7 @@ namespace ams::controller {
 
         // Timestamps handling is still a bit unclear, these are the values that result in no drifting.
         // The system turns the change in rotation between reports into angular velocity using these timestamps, and
-        // reads them in units of about 1.23 ms rather than 1 ms: in milliseconds every pad read about 81% of its turn
+        // reads them in units of 1.25 ms (the IMU's 800 Hz sampling) rather than 1 ms: in milliseconds every pad read about 81% of its turn
         // rate (DualShock 4 and 8BitDo alike, at different report rates) while the orientation itself was exact.
         auto timestamp_start = os::ConvertToTimeSpan(m_previous_tick).GetNanoSeconds() / QuaternionTimestampUnitNs;
         motion_data->quaternion.packing_mode_2.timestamp_start_l = timestamp_start & 0x1;

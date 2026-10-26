@@ -20,6 +20,7 @@
 #define AMS_BTDRV_MITM_INTERFACE_INFO(C, H)                                                                                                                                                                                             \
     AMS_SF_METHOD_INFO(C, H, 1,     Result, InitializeBluetooth,              (sf::OutCopyHandle out_handle),                                                           (out_handle))                                                   \
     AMS_SF_METHOD_INFO(C, H, 2,     Result, EnableBluetooth,                  (),                                                                                       ())                                                             \
+    AMS_SF_METHOD_INFO(C, H, 34,    Result, EnableRadio,                      (bool enable),                                                                            (enable))                                                       \
     AMS_SF_METHOD_INFO(C, H, 8,     Result, StartInquiry,                     (u32 services, s64 duration),                                                             (services, duration))                                           \
     AMS_SF_METHOD_INFO(C, H, 9,     Result, StopInquiry,                      (),                                                                                       ())                                                             \
     AMS_SF_METHOD_INFO(C, H, 15,    Result, GetEventInfo,                     (sf::Out<ams::bluetooth::EventType> out_type, const sf::OutPointerBuffer &out_buffer),    (out_type, out_buffer))                                         \
@@ -63,6 +64,7 @@ namespace ams::mitm::bluetooth {
         public:
             Result InitializeBluetooth(sf::OutCopyHandle out_handle);
             Result EnableBluetooth();
+            Result EnableRadio(bool enable);
             Result StartInquiry(u32 services, s64 duration);
             Result StopInquiry();
             Result GetEventInfo(sf::Out<ams::bluetooth::EventType> out_type, const sf::OutPointerBuffer &out_buffer);

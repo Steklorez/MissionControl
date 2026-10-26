@@ -77,6 +77,21 @@ namespace ams::mitm::bluetooth {
         R_SUCCEED();
     }
 
+    Result BtdrvMitmService::EnableRadio(bool enable) {
+        ams::ble::log::Write("btdrv EnableRadio(%u) from program 0x%016lx", enable, m_client_info.program_id.value);
+
+        // The BLE links are dropped while the radio still works, and picked up again once it is back
+        if (!enable) {
+            ams::ble::OnBluetoothRadio(false);
+        }
+        R_TRY(btdrvEnableRadioFwd(m_forward_service.get(), enable));
+        if (enable) {
+            ams::ble::OnBluetoothRadio(true);
+        }
+
+        R_SUCCEED();
+    }
+
     Result BtdrvMitmService::GetEventInfo(sf::Out<ams::bluetooth::EventType> out_type, const sf::OutPointerBuffer &out_buffer) {
         R_RETURN(ams::bluetooth::core::GetEventInfo(m_client_info.program_id, out_type.GetPointer(), out_buffer.GetPointer(), out_buffer.GetSize()));
     }
